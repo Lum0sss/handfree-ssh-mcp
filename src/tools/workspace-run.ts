@@ -4,20 +4,9 @@ import { RunService } from "../run/run-service.js";
 import { runErrorEnvelope, toToolResult } from "./run-envelope.js";
 
 /**
- * PLAN.MD P2-02/P2-05/P2-06: registers workspace-run. This round implements
- * the full pipeline: [push] -> preflight -> launching -> remote-running ->
- * [collect]. push defaults to true (profile defaultPush may override) and
- * requires runProfiles.<name>.push.paths to be configured; collect defaults
- * to the profile's collect.paths (never the whole remoteRoot) and requires
- * runProfiles.<name>.collect.localDir.
- *
- * A plain launch (no collect requested -- the common case) still returns as
- * soon as the remote process is confirmed started, unchanged from before
- * this round. When collect IS requested, this call additionally blocks
- * (bounded by timeout) until the run reaches a terminal state, then collects
- * -- see run-service.ts's waitForTerminalStatus/runCollect. The run itself
- * is durable either way: it keeps running on the remote host regardless of
- * what this tool call does or how long it waits.
+ * Registers the durable Linux runner: optional push -> launch -> optional
+ * collect, with inline settings or a saved profile. A plain launch returns
+ * after startup; collecting waits for a terminal state up to timeout.
  */
 export function registerWorkspaceRunTool(server: McpServer): void {
   const runService = RunService.getInstance();

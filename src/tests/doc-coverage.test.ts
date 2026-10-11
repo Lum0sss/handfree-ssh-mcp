@@ -128,10 +128,10 @@ describe("documentation coverage: every tool parameter appears in that tool's he
     // both the per-tool help and the server prompt must actually say so --
     // an inline capability nobody is told about is the same dead end.
     const helpText = TOOL_HELP_FOR_TEST["workspace-run"];
-    assert.match(helpText, /No YAML config required/i);
+    assert.match(helpText, /No YAML run profile is required/i);
     assert.match(helpText, /remoteRoot/);
     assert.match(helpText, /venv/);
-    assert.match(SERVER_INSTRUCTIONS, /workspace-run[\s\S]*NO YAML configuration/);
+    assert.match(SERVER_INSTRUCTIONS, /workspace-run[\s\S]*No YAML run profile is required/);
     for (const parameter of ["remoteRoot", "venv", "pushPaths", "collectLocalDir"]) {
       assert.ok(
         SERVER_INSTRUCTIONS.includes(parameter),
@@ -154,7 +154,7 @@ describe("documentation coverage: every tool parameter appears in that tool's he
       /workspace-run\s+Launch an entrypoint on a remote server under a runProfiles/,
       "the bare `help` index must not describe workspace-run as requiring a configured profile",
     );
-    assert.match(TOOL_OVERVIEW_FOR_TEST, /workspace-run[\s\S]*?no YAML config needed/);
+    assert.match(TOOL_OVERVIEW_FOR_TEST, /workspace-run[^\n]*no YAML run profile needed/);
     assert.match(TOOL_HELP_FOR_TEST["run-list"], /\(ad-hoc\)/, "run-list must say how to list inline runs");
     assert.match(
       TOOL_HELP_FOR_TEST["run-retry"],
@@ -177,7 +177,7 @@ describe("documentation coverage: every tool parameter appears in that tool's he
     }
   });
 
-  test("the connections guidance states the real remote limit and the measured returns, not just that the option exists", () => {
+  test("detailed help retains connection limits and measured returns without duplicating them in the server prompt", () => {
     // The N handshakes are made concurrently, so the remote limit a user can
     // actually hit is sshd's MaxStartups (unauthenticated connections), not
     // MaxSessions -- documenting the knob without naming it invites a
@@ -188,8 +188,26 @@ describe("documentation coverage: every tool parameter appears in that tool's he
     assert.match(helpText, /MaxStartups/, "help must name the remote limit that actually applies to N connections");
     assert.match(helpText, /concurrent/i, "help must say the handshakes are concurrent -- that is why MaxStartups applies");
     assert.match(helpText, /Diminishing returns/i, "help must state the measured returns, not imply more is always better");
-    assert.match(SERVER_INSTRUCTIONS, /MaxStartups/);
-    assert.match(SERVER_INSTRUCTIONS, /concurrently/);
-    assert.match(SERVER_INSTRUCTIONS, /diminishing returns/i);
+    assert.match(SERVER_INSTRUCTIONS, /connections[\s\S]*1-8/);
+    assert.match(SERVER_INSTRUCTIONS, /See help for constraints and tuning/);
+  });
+
+  test("help reflects current transfer defaults and parallel directory support", () => {
+    for (const tool of ["upload", "download", "transfer"]) {
+      assert.match(TOOL_HELP_FOR_TEST[tool], /fast\s+\(boolean, optional\)\s+Default true/);
+      assert.doesNotMatch(TOOL_HELP_FOR_TEST[tool], /recursion stays sequential|streaming\s+SFTP pipe/);
+    }
+    assert.match(TOOL_HELP_FOR_TEST.transfer, /fileConcurrency/);
+    assert.match(TOOL_HELP_FOR_TEST.transfer, /Relay: prefetched source chunks, default\s+64/);
+    assert.match(TOOL_HELP_FOR_TEST.upload, /allowedLocalDirectories/);
+    assert.match(TOOL_HELP_FOR_TEST.download, /allowedLocalDirectories/);
+  });
+
+  test("command and task guidance distinguishes remote shell sessions and durable Linux runs", () => {
+    assert.match(SERVER_INSTRUCTIONS, /cmdString unchanged/);
+    assert.match(SERVER_INSTRUCTIONS, /connection reuse does not preserve cd/);
+    assert.match(SERVER_INSTRUCTIONS, /stream=true[\s\S]*not streaming within the tool call/);
+    assert.match(TOOL_HELP_FOR_TEST["workspace-run"], /Linux remote with bash, setsid and \/proc/);
+    assert.doesNotMatch(TOOL_HELP_FOR_TEST["workspace-run"], /zero config|nothing configured anywhere/);
   });
 });

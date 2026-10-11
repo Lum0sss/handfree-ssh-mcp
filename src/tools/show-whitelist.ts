@@ -135,7 +135,7 @@ export function registerShowWhitelistTool(server: McpServer): void {
         // ----- Remote directories -----
         output += `### Allowed remote directories\n\n`;
         if (config.disableSftpPathPolicy || allowedRemoteDirs.length === 0) {
-          output += `\`allowedRemoteDirectories\` is not configured, so **any absolute POSIX path is allowed** (default is open). ` +
+          output += `The remote directory allowlist is inactive, so **any absolute POSIX path is allowed**. ` +
             `To restrict SFTP to specific directories, add them under \`allowedRemoteDirectories\` in the server's YAML config.\n\n`;
         } else {
           output += `${allowedRemoteDirs.length} entr${allowedRemoteDirs.length === 1 ? "y" : "ies"} (restricting SFTP to these paths only):\n\n`;
@@ -177,10 +177,10 @@ export function registerShowWhitelistTool(server: McpServer): void {
         const outputLogRoot = sshManager.getOutputLogRoot();
         const serverLogDir = `${outputLogRoot}/${config.name}/${config.username}`.replace(/\\/g, "/");
         output += `## 📝 \`execute-command\` Output Logs\n\n`;
-        output += `Every \`execute-command\` call returns at most \`maxOutputBytes\` (default 65536) bytes per stream, tail-only. The FULL stdout/stderr is always persisted to disk:\n\n`;
+        output += `With \`stream=false\`, \`execute-command\` returns at most \`maxOutputBytes\` (default 65536) bytes per stdout/stderr stream, tail-only. With \`stream=true\`, it returns \`runId/logPath\` for polling via \`command-status\`. Full command output is saved locally:\n\n`;
         output += `- Root: \`${outputLogRoot}\` _(override via the top-level \`outputLogDir:\` field in \`servers.yaml\`)_\n`;
         output += `- This server's logs land under: \`${serverLogDir}/\`\n`;
-        output += `- File name: \`<timestamp>-<pid>-<rand>.log\` with \`=== META / STDOUT / STDERR / END ===\` markers.\n`;
+        output += `- Buffered command logs use \`<timestamp>-<pid>-<rand>.log\` with \`=== META / STDOUT / STDERR / END ===\` markers; background commands return their own \`logPath\`.\n`;
         output += `- When output is truncated, the response includes an \`[OUTPUT TRUNCATED]\` header with the on-disk log path.\n\n`;
 
         return {
