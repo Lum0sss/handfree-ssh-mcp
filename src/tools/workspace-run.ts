@@ -24,27 +24,23 @@ export function registerWorkspaceRunTool(server: McpServer): void {
 
   server.tool(
     "workspace-run",
-    "Launch an entrypoint on a remote server, durably: the launched process survives SSH disconnect and MCP adapter restart, because all of its state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives on the remote filesystem under ~/.handfree-runs/<runId>/, not locally. There is no local cache of run state -- status/logs/cancel require the remote server to be reachable. " +
-      "NO CONFIG REQUIRED: pass remoteRoot plus venv (or executable) inline and it runs against any enabled SSH server, including ones that come from ~/.ssh/config. Example: { server: \"gpu-box\", remoteRoot: \"/data/proj\", venv: \"/data/envs/proj\", entrypoint: \"train.py\", args: [\"--epochs\", \"10\"] }. A saved runProfiles.<name> entry is an optional preset for the same fields (and the only way to NARROW what may run, via allowedEntrypoints) -- not a prerequisite. " +
-      "Full pipeline: [push] -> preflight -> launching -> remote-running -> [collect]. push uploads the push sources to remoteRoot first (batch/recursive upload, skip-if-identical); it defaults to true for a profile that declares push.paths and to false for an inline run unless you pass pushPaths. collect (default the profile's collect.paths) pulls artifacts back by explicit glob after the run finishes and needs a local destination (profile collect.localDir, or collectLocalDir inline); pass collect:[] to disable it. Requesting collect makes this call block (bounded by timeout) until the run reaches a terminal state before returning -- omitting collect keeps the original fire-and-forget behavior (returns as soon as the process is confirmed started). " +
-      "sync only accepts 'none'/omitted; sync:'flush' returns SYNC_NOT_AVAILABLE (deferred to Phase 3). " +
-      "Only environment.type venv/executable is supported (inline venv/executable always is); a configured profile using conda/module/slurm or gpu.required/secretEnv returns a *_NOT_AVAILABLE error.",
+    "Start a durable task on a Linux remote with bash, setsid and /proc. Pass remoteRoot, entrypoint and venv/executable inline, or use a saved profile. Optionally push code before launch and collect artifacts after completion. Returns after startup unless collect is requested. State survives SSH disconnects and MCP restarts; poll run-status/run-logs with the returned runId and server. jobId equals runId.",
     {
-      profile: z.string().min(1).optional().describe("Optional. Name of a saved runProfiles.<name> entry from this server's YAML config. Omit it to run inline with no YAML at all: pass remoteRoot plus venv or executable instead."),
-      remoteRoot: z.string().min(1).optional().describe("Inline mode (no profile): absolute remote directory the entrypoint lives in. It is also the working directory of the launched process and the root that entrypoint/collect globs resolve against. Ignored when profile is given (the profile's own remoteRoot wins)."),
-      venv: z.string().min(1).optional().describe("Inline mode: absolute path to a Python virtualenv on the remote. The process runs <venv>/bin/python (or <venv>/bin/<executable> if executable is also given) directly -- no 'source activate' needed."),
-      executable: z.string().min(1).optional().describe("Inline mode: the interpreter/program to run the entrypoint with, e.g. 'bash', 'python3', '/usr/bin/node'. With venv, this instead names the binary inside <venv>/bin. One of venv or executable is required in inline mode."),
-      pushPaths: z.array(z.string().min(1)).optional().describe("Inline mode: local files/directories to upload into remoteRoot before launch (skip-if-identical). Supplying this turns push on; omitting it means push defaults to false for an inline run, because remoteRoot is assumed to already hold the code."),
-      collectLocalDir: z.string().min(1).optional().describe("Inline mode: local directory that collected artifacts are written into. Required if you pass collect with a non-empty list."),
-      entrypoint: z.string().min(1).describe("Path to the script/program to run, relative to remoteRoot. Must be a plain relative path (no '..', not absolute). With a profile, it must also match one of that profile's allowedEntrypoints globs; inline runs allow any relative path under remoteRoot."),
-      args: z.array(z.string()).optional().describe("Positional arguments passed to the entrypoint. Each is quoted individually on the remote shell and never interpreted -- safe for arbitrary strings including spaces, quotes, and shell metacharacters."),
-      env: z.record(z.string(), z.string()).optional().describe("Environment variables for the launched process. With a profile, every key must already be a key of that profile's env map (the profile's env doubles as the allowlist) or you get ENV_KEY_NOT_ALLOWED; inline, these keys ARE the environment, so any key is accepted."),
-      server: z.string().optional().describe("Target server name. With a profile, defaults to the profile's configured server. Inline (no profile), this is the server to run on; it may be omitted only when exactly one server is enabled."),
-      push: z.boolean().optional().describe("Uploads the push sources to remoteRoot before launch. Defaults to true for a profile with push.paths (or its defaultPush), and to false for an inline run unless you pass pushPaths. Pass false to skip and use code already present under remoteRoot."),
-      collect: z.array(z.string()).optional().describe("Glob patterns (relative to remoteRoot) of artifacts to pull back after the run finishes. Defaults to the profile's collect.paths; an empty array explicitly disables collect for this call. Requesting collect makes this call wait (bounded by timeout) for the run to finish. Needs a local destination: the profile's collect.localDir, or collectLocalDir inline."),
-      sync: z.enum(["none", "flush"]).optional().describe("Only 'none' (or omitted) is available. 'flush' returns SYNC_NOT_AVAILABLE (Phase 3)."),
-      timeout: z.number().int().positive().optional().describe("Only meaningful when collect actually runs: milliseconds to wait for the run to reach a terminal state before giving up on collect (the run itself keeps running regardless). Defaults to the profile's timeout, or 600000ms (10 minutes)."),
-      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for every remote call this launch makes (push upload, entrypoint stat/hash, the launch exec itself, and collect if requested). Default true. Set false after a timeout or suspected stale/bad cached connection to force fresh ones for this call."),
+      profile: z.string().min(1).optional().describe("Optional runProfiles name from YAML. Omit to supply remoteRoot and venv/executable inline."),
+      remoteRoot: z.string().min(1).optional().describe("Inline: absolute remote working directory, containing entrypoint and collected artifacts. A profile overrides this field."),
+      venv: z.string().min(1).optional().describe("Inline: absolute virtualenv path. Runs <venv>/bin/python, or <venv>/bin/<executable> if specified."),
+      executable: z.string().min(1).optional().describe("Inline: interpreter/program, e.g. python3, bash or /usr/bin/node; with venv, a binary under <venv>/bin. Require venv or executable."),
+      pushPaths: z.array(z.string().min(1)).optional().describe("Inline: local files/directories to upload before launch. Enables push by default when non-empty."),
+      collectLocalDir: z.string().min(1).optional().describe("Inline: local output directory; required when collect is non-empty."),
+      entrypoint: z.string().min(1).describe("Script/program path relative to remoteRoot; no absolute paths or .. segments. Profiles also enforce allowedEntrypoints."),
+      args: z.array(z.string()).optional().describe("Arguments passed individually with shell quoting; shell metacharacters are not expanded."),
+      env: z.record(z.string(), z.string()).optional().describe("Process environment. With a profile, overrides may only use keys declared in its env map; inline accepts valid environment keys."),
+      server: z.string().optional().describe("Same server names as connectionName in other tools. Defaults to the profile target, or the sole enabled server."),
+      push: z.boolean().optional().describe("Upload before launch. Inline defaults to whether pushPaths is non-empty. Profiles use defaultPush, otherwise true; enabled push requires sources. False reuses remote code."),
+      collect: z.array(z.string()).optional().describe("Artifact globs relative to remoteRoot, default profile collect.paths. [] disables. Non-empty collect waits for completion and needs a local destination."),
+      sync: z.enum(["none", "flush"]).optional().describe("Only none or omitted is supported. flush returns SYNC_NOT_AVAILABLE."),
+      timeout: z.number().int().positive().optional().describe("Collect wait limit in milliseconds; does not limit task runtime. Default profile timeout or 600000."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
     },
     async ({ profile, remoteRoot, venv, executable, pushPaths, collectLocalDir, entrypoint, args, env, server, push, collect, sync, timeout, reuseConnection }) => {
       try {
@@ -70,7 +66,7 @@ export function registerWorkspaceRunTool(server: McpServer): void {
           jobId: result.runId,
           state: result.status.state,
           message: `Launched run '${result.runId}' on server '${result.server}'.`,
-          next: `Poll run-status { runId: "${result.runId}" } or run-logs { runId: "${result.runId}" } for progress; run-cancel { runId: "${result.runId}" } to stop it.`,
+          next: `Poll run-status { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } or run-logs { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } for progress; run-cancel { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } to stop it.`,
           details: { runId: result.runId, server: result.server, phases: result.phases, status: result.status, collect: result.collect },
         });
       } catch (error) {

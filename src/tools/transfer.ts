@@ -20,109 +20,76 @@ export function registerTransferTool(server: McpServer): void {
 
   server.tool(
     "transfer",
-    `Transfer files between the MCP host and remote servers, or between two remote servers.
-
-Modes:
-  upload   — push a local file or directory to a remote server.
-  download — pull a remote file or directory to the MCP host.
-  relay    — copy a file from one remote server to another. Default strategy
-             ("relay") streams it via a bounded parallel SFTP read-ahead
-             window through this MCP host; no temp file touches the MCP host
-             disk, and no SCP or authorized-key exchange between the two
-             servers is needed. strategy="direct" instead runs the copy ON
-             the source server (rsync, else tar piped over ssh) so this MCP
-             host never reads or writes the file's bytes at all; it requires
-             the source server to already be able to reach the destination
-             directly (no NAT traversal) with its own pre-existing SSH trust
-             (host key + non-interactive key auth already set up on the
-             source — this tool never transfers a private key). strategy="auto"
-             uses direct when possible and otherwise falls back to relay,
-             reporting the real reason it fell back.
-
-Set recursive=true when transferring a directory (upload/download only).
-Set archive=true to package a file or directory into one temporary tar before
-transfer and extract it into the destination directory. Archive mode does not
-require recursive=true.
-For relay mode, specify sourceServer, sourceRemotePath, destServer, destRemotePath.`,
+    "Transfer files or directories between the MCP host and remote servers, or between two remotes. mode=relay selects remote-to-remote copying; strategy selects relay/direct/auto. Use recursive for directory upload/download, archive for tar packing, and array localPath for batch upload. See help for mode-specific constraints.",
     {
       mode: z.enum(["upload", "download", "relay"]).describe(
-        "'upload' pushes local → remote. 'download' pulls remote → local. 'relay' copies remote-A → remote-B through the MCP host.",
+        "upload: local to remote; download: remote to local; relay: remote to remote, with transport selected by strategy.",
       ),
       localPath: z.union([
         z.string(),
         z.array(z.string()),
       ]).optional().describe(
-        "(upload/download only) Path on the MCP host. Upload only: an array batch-uploads multiple independent files to the same remotePath directory, each landing at remotePath/<basename> (basename collisions or repeated paths fail the whole call before anything is written remotely; max 1000 entries; not combinable with archive=true; returns structured JSON instead of the plain-text single-file result). Must be inside the MCP working directory or one of the server's allowedLocalDirectories.",
+        "Upload/download: local path within the MCP working directory/allowedLocalDirectories unless path policy is disabled. Upload arrays batch up to 1000 files into remotePath/<basename>; duplicate targets are rejected. Batch excludes recursive/archive.",
       ),
       remotePath: z.string().optional().describe(
-        "(upload/download only) Absolute POSIX path on the remote server. Any path is allowed by default; restricted to allowedRemoteDirectories only if the server configures that list — call show-whitelist to check.",
+        "Upload/download: absolute remote POSIX path, subject to SFTP path policy.",
       ),
       connectionName: z.string().optional().describe(
-        "(upload/download only) Target server name from list-servers. Required when multiple servers are enabled.",
+        "Upload/download: Server name from list-servers. Required with multiple enabled servers; optional with one.",
       ),
       sourceServer: z.string().optional().describe(
-        "(relay only) Server name to download the file from.",
+        "Remote-to-remote: source server name.",
       ),
       sourceRemotePath: z.string().optional().describe(
-        "(relay only) Absolute POSIX file path on the source server. Any path is allowed by default unless the source server configures allowedRemoteDirectories.",
+        "Remote-to-remote: absolute source POSIX path, subject to source path policy.",
       ),
       destServer: z.string().optional().describe(
-        "(relay only) Server name to upload the file to.",
+        "Remote-to-remote: destination server name.",
       ),
       destRemotePath: z.string().optional().describe(
-        "(relay only) Absolute POSIX destination path on the target server. Any path is allowed by default unless the destination server configures allowedRemoteDirectories.",
+        "Remote-to-remote: absolute destination POSIX path, subject to destination path policy.",
       ),
       strategy: transferStrategySchema.optional().describe(
-        "(relay only) 'relay' (default) — unchanged behavior, streams through this MCP host via SFTP. " +
-          "'direct' — run the copy on the source server (rsync, else tar|ssh; never rclone) so this MCP host " +
-          "relays zero file-data bytes; fails explicitly with the precise reason if not possible (source cannot " +
-          "reach the destination directly, destination host key not pinned on the source, non-interactive " +
-          "existing-remote-key auth unavailable, or no backend installed on the source). " +
-          "'auto' — probes the same conditions and uses direct when possible, otherwise falls back to relay " +
-          "and reports the real reason it fell back. Never auto-accepts an unknown destination host key and " +
-          "never transfers a private key; auth relies entirely on keys/trust already present on the source server.",
+        "Remote-to-remote only: relay (default) uses this MCP host via SFTP; direct runs rsync or tar|ssh on the source; auto tries direct then falls back with a reason. Direct requires source-to-destination reachability and existing key/host-key trust; keys are never copied or auto-accepted.",
       ),
       recursive: z.boolean().optional().describe(
-        "(upload/download only) When true, transfers an entire directory tree recursively. Default false.",
+        "Upload/download directory tree, default false. Not combinable with batch.",
       ),
       skipIfIdentical: z.boolean().optional().describe(
-        "When true (default), skip the transfer if the destination already matches the source. " +
-          "Upload: byte-compare for files \u2264 256 MiB, MD5 otherwise; shell scripts (.sh / .bash / .zsh) ignore CRLF\u2194LF differences. " +
-          "Relay: size match + md5sum match on both servers (when available); falls back to transferring if md5sum is missing on either side. " +
-          "Download is never skipped. Set to false to force the transfer.",
+        "Default true: skip matching uploads or relays. Upload compares content, ignoring shell-script CRLF/LF differences; relay checks size+MD5 when available. Downloads are never skipped.",
       ),
       reuseConnection: z.boolean().optional().describe(
-        "Default true. Reuse cached SSH connection(s) for SFTP. Set false after a timeout or suspected stale cached connection to force fresh TCP/SSH connection(s) for this transfer; fresh connections close afterwards.",
+        "Default true. Set false to use a fresh SSH connection after a suspected stale connection.",
       ),
       timeout: z.number().positive().optional().describe(
-        "Timeout in ms for SSH setup and SFTP channel opening. Transfer stream duration itself is not forcibly interrupted by this option.",
+        "Milliseconds for SSH setup and SFTP channel opening; does not cap transfer duration.",
       ),
       vvv: z.boolean().optional().describe(
-        "Default false. Append bounded SSH/SFTP debug output for single-file and relay results, and for recursive errors. For fresh ssh2 handshake logs, also set reuseConnection=false.",
+        "Default false. Include bounded SSH debug output; fresh handshake logs also require reuseConnection=false.",
       ),
       fast: z.boolean().optional().describe(
-        "Default true. Upload/download use ssh2 fastPut/fastGet with parallel SFTP chunks for better throughput. Set false for the buffered compatibility path. Relay mode always uses its bounded parallel read-ahead path.",
+        "Default true for upload/download: parallel SFTP chunks. False uses buffered transfer. Relay uses bounded parallel read-ahead independently of fast.",
       ),
       sftpConcurrency: z.number().int().positive().optional().describe(
-        "Upload/download: only used when fast=true. Relay: number of concurrent prefetched source chunks, default 64. The relay window is bounded to 64 MiB.",
+        "Upload/download with fast=true: concurrent SFTP chunks. Relay: prefetched chunks, default 64; total window at most 64 MiB.",
       ),
       chunkSize: z.number().int().positive().optional().describe(
-        "Upload/download: only used when fast=true. Relay: bytes per prefetched source chunk, default 32768. The relay window is bounded to 64 MiB.",
+        "Upload/download with fast=true: bytes per chunk. Relay: default 32768; total window at most 64 MiB.",
       ),
       fileConcurrency: z.number().int().positive().optional().describe(
-        "Recursive upload/download only: maximum independent files transferred in parallel. Default 4, maximum 8. Each file transferred in parallel opens its own SFTP channel on the same SSH connection, and the cap is kept under OpenSSH's common default MaxSessions=10 so it does not reliably fail against a default-configured remote sshd. This improves directory trees with many small files without creating an archive.",
+        "Recursive upload/download or batch upload: parallel files on one SSH connection. Default 4, maximum 8.",
       ),
       connections: z.number().int().positive().optional().describe(
-        "Single file only, in every mode (not recursive, not archive, not batch); for mode=\"relay\" only with strategy=\"relay\" (the default), since direct/auto copy on the source server. Default 1 (today's single-connection behavior, unchanged). A value above 1 moves the file over that many independent SSH/TCP connections, each carrying its own non-overlapping byte range; maximum 8. Relay opens that many connections on EACH server (one per server for a self-relay), one byte range per source/destination pair. Upload and relay write one remote temp file that then replaces the destination path (atomically where the server supports posix-rename@openssh.com, as OpenSSH does; otherwise the old file is removed first), and a failure leaves remotePath untouched. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection, and all N handshakes happen concurrently -- so the relevant remote limit is sshd's MaxStartups (concurrent unauthenticated connections; OpenSSH's default 10:30:100 starts dropping at 10), not MaxSessions. Download measured on a 50ms/1Gbps link against 17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s, i.e. diminishing returns past 4. Upload of 128 MiB at 50ms RTT against 29.8 MiB/s for one connection: 2 -> 35.2, 4 -> 43.5, 8 -> 44.9 MiB/s. Relay of 128 MiB with a 50ms/1Gbps source leg against 16.4 MiB/s for one connection: 2 -> 23.7, 4 -> 33.6, 8 -> 31.7 MiB/s (8 no better than 4). Gains depend on your link's RTT and bandwidth; none on a fast LAN. Ignores fast/sftpConcurrency/chunkSize when above 1; reuseConnection=false bypasses the pool (fresh connections, closed afterwards). The connections are pooled per server (at most 8 per server; a transfer needing more waits; idle ones close after 60 s), so a repeated transfer reuses them and skips the handshakes.",
+        "Single file only: 1-8 independent SSH/TCP connections, default 1. Relay opens N per server and requires strategy=relay. Excludes batch/recursive/archive/direct/auto. Above 1 ignores fast/sftpConcurrency/chunkSize; see help for limits.",
       ),
       archive: z.boolean().optional().describe(
-        "When true, package the source file/directory into one temporary tar, transfer it, extract it into the destination directory, then clean both temporary archives. Default false.",
+        "Default false. Pack into a temporary tar, transfer, extract into the destination directory and clean temporary archives. Does not require recursive=true.",
       ),
       archiveCompression: z.enum(["none", "gzip", "bzip2", "xz", "zstd"]).optional().describe(
-        "Only used when archive=true. Compression for the temporary tar; default none. Requires compatible tar/compressor support on every remote endpoint that packs or extracts the archive.",
+        "With archive=true: none (default), gzip, bzip2, xz or zstd. Packing/extracting endpoints need compatible tar/compressor support.",
       ),
       onError: z.enum(["abort", "continue"]).optional().describe(
-        "Batch upload only (mode=upload with array localPath). Default 'abort': stop scheduling new files once one fails, drain in-flight ones, then report. 'continue': attempt every file regardless of earlier failures. Both modes report a per-file uploaded/skipped/failed status.",
+        "Batch upload only: abort (default) stops scheduling after failure; continue attempts all files. In-flight files finish and all outcomes are reported.",
       ),
     },
     async (params) => {

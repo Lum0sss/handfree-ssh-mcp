@@ -12,12 +12,12 @@ export function registerCloseConnectionTool(server: McpServer): void {
 
   server.tool(
     "close-connection",
-    "Close the cached SSH connection for a configured server. Use this after a timeout, stale connection suspicion, or before retrying a host with a clean cached connection. This affects only cached/reused SSH clients; reuseConnection=false command clients already close after each command. Closing a jump host also closes cached target connections whose jump chain uses that host.",
+    "Close cached SSH connections for a server, including transfer connections. Closing a jump host also closes dependent target connections. Fresh connections from reuseConnection=false close after use.",
     {
       connectionName: z
         .string()
         .optional()
-        .describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
+        .describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
     },
     async ({ connectionName }) => {
       try {

@@ -9,25 +9,25 @@ export function registerCommandStatusTool(server: McpServer): void {
 
   server.tool(
     "command-status",
-    "Get status and live output for a background command started by execute-command with stream=true. Incremental mode is enabled by default and maintains one process-local cursor per runId, so repeated calls return only newly appended outputChunk data. Set incremental=false to return the current outputTail; this still advances the cursor to the current file end. Status and cursor are kept in the current MCP server process; after a server restart, use the returned logPath directly.",
+    "Read status and output for execute-command with stream=true. Incremental polling advances a process-local cursor per runId; offset overrides it. After MCP restart, status is unavailable; read the saved logPath directly.",
     {
-      runId: z.string().describe("Background command runId returned by execute-command when stream=true."),
+      runId: z.string().describe("runId from execute-command with stream=true."),
       maxOutputBytes: z
         .number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Maximum bytes of the tail or incremental chunk to return. Defaults to 65536. Incremental backlog is returned over multiple calls with hasMore=true instead of being skipped."),
+        .describe("Maximum output bytes, default 65536. Incremental backlog is paged with hasMore=true."),
       offset: z
         .number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Optional byte offset that overrides the run's stored incremental cursor for this call. The resulting nextOffset becomes the new stored cursor."),
+        .describe("Byte offset overriding the stored cursor; nextOffset becomes the new cursor."),
       incremental: z
         .boolean()
         .optional()
-        .describe("Default true. Return only output added since this run's stored cursor. When false, return the current tail but still advance the stored cursor to the current file end."),
+        .describe("Default true: return new output. False: return the current tail and advance the cursor to file end."),
     },
     async ({ runId, maxOutputBytes, offset, incremental }) => {
       try {

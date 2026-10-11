@@ -8,11 +8,11 @@ export function registerRunStatusTool(server: McpServer): void {
 
   server.tool(
     "run-status",
-    "Query the current status of a workspace-run launch by runId. Read directly from the remote state directory over SFTP every call -- there is no local cache, so the remote server must be reachable, and a restarted MCP adapter can query exactly as well as one that has been running the whole time. Returns exitCode/signal once the run has finished.",
+    "Read a workspace-run task status from the remote state directory. Requires the original server to be reachable; works after MCP restart. Returns exitCode/signal when finished.",
     {
-      runId: z.string().min(1).describe("runId returned by workspace-run."),
-      connectionName: z.string().optional().describe("Target server name from list-servers (the server the run was launched on). Required when multiple servers are enabled; optional when only one server is enabled."),
-      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
+      runId: z.string().min(1).describe("runId from workspace-run or run-retry."),
+      connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
     },
     async ({ runId, connectionName, reuseConnection }) => {
       try {

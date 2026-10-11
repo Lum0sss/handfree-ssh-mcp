@@ -89,12 +89,12 @@ export function registerShowWhitelistTool(server: McpServer): void {
 
   server.tool(
     "show-whitelist",
-    "Show the configured command policy, blacklist/whitelist patterns, and SFTP path policy (allowedRemoteDirectories / allowedLocalDirectories) for a server. Use this before execute-command when you need to understand which commands are allowed, why a command may be rejected, or what command patterns are safe to try next. Also use it before upload / download / transfer to see which paths SFTP is permitted to touch.",
+    "Show the full command policy (blacklist/whitelist), SFTP path policy and output log location. The legacy tool name does not imply whitelist mode. Use after a policy rejection or to inspect configured restrictions.",
     {
       connectionName: z
         .string()
         .optional()
-        .describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
+        .describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
     },
     async ({ connectionName }) => {
       try {

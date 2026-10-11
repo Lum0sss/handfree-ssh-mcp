@@ -8,14 +8,14 @@ export function registerRunLogsTool(server: McpServer): void {
 
   server.tool(
     "run-logs",
-    "Read a byte-offset window of a workspace-run's stdout or stderr log, fetched over SFTP directly from the remote file. Correctly handles a multi-byte UTF-8 character split across the window boundary (never duplicates or drops bytes across sequential calls at the returned nextOffset). Pass the previous response's nextOffset as the next call's offset to page through new output; hasMore indicates more bytes are already available beyond nextOffset.",
+    "Read stdout or stderr of a workspace-run task from the remote file. Continue with offset=nextOffset; hasMore means additional bytes are already available.",
     {
-      runId: z.string().min(1).describe("runId returned by workspace-run."),
-      connectionName: z.string().optional().describe("Target server name from list-servers (the server the run was launched on). Required when multiple servers are enabled; optional when only one server is enabled."),
-      stream: z.enum(["stdout", "stderr"]).optional().describe("Default stdout."),
-      offset: z.number().int().nonnegative().optional().describe("Byte offset to start reading from. Default 0 (from the start of the file). Use the previous response's nextOffset to continue."),
-      maxOutputBytes: z.number().int().positive().optional().describe(`Maximum bytes to return in this call. Default ${DEFAULT_LOG_MAX_BYTES}.`),
-      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
+      runId: z.string().min(1).describe("runId from workspace-run or run-retry."),
+      connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
+      stream: z.enum(["stdout", "stderr"]).optional().describe("Log to read: stdout (default) or stderr."),
+      offset: z.number().int().nonnegative().optional().describe("Starting byte offset, default 0. Continue using the returned nextOffset."),
+      maxOutputBytes: z.number().int().positive().optional().describe("Maximum bytes to read, default 65536."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
     },
     async ({ runId, connectionName, stream, offset, maxOutputBytes, reuseConnection }) => {
       try {

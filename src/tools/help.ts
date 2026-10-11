@@ -669,7 +669,7 @@ export const TOOL_OVERVIEW_FOR_TEST: string = TOOL_OVERVIEW;
 export function registerHelpTool(server: McpServer): void {
   server.tool(
     "help",
-    "Show detailed usage instructions for one or all tools. Call with no arguments for an overview, or specify a tool name for full parameter docs and examples.",
+    "Show a tool overview, or full parameter docs and examples for the selected tool.",
     {
       tool: z.string().optional().describe("Tool name to get detailed help for. Omit to see an overview of all tools."),
     },
