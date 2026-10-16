@@ -1,0 +1,20 @@
+schemaVersion: 1
+id: rexp
+description: Independent experiment queue, scheduler, checkpoints and environment catalog.
+components:
+  - id: worker
+    target: ssh
+    description: Run lab on the selected SSH server. File transfer uses SSH MCP SFTP tools.
+    source:
+      kind: pip
+      location: https://test.pypi.org/simple/
+      package: rexp-server
+    entry: ['${labPath}']
+    version: ['${labPath}', version]
+    env:
+      PLATFORM_ROOT: '${platformRoot}'
+    install: ['${platformPython}', -m, pip, install, --index-url, 'https://test.pypi.org/simple/', --extra-index-url, 'https://pypi.org/simple/', rexp-server]
+    update: ['${platformPython}', -m, pip, install, --upgrade, --index-url, 'https://test.pypi.org/simple/', --extra-index-url, 'https://pypi.org/simple/', rexp-server]
+    skills:
+      list: ['${labPath}', skills, list, --json]
+      show: ['${labPath}', skills, show, '${skill}', --json]

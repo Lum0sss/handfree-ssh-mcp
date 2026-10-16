@@ -1,0 +1,13 @@
+schemaVersion: 1
+id: rexp-web
+description: Optional REXP Hub Web interface on the MCP host.
+components:
+  - id: web
+    target: local
+    description: Controls an existing Web checkout using its persistent start/stop/status/logs commands.
+    source:
+      kind: local-checkout
+      location: Set webRoot to your separately installed lab-platform-web checkout.
+    entry: [node, '${webRoot}/scripts/web.mjs']
+    version: [npm, --prefix, '${webRoot}', pkg, get, version]
+    install: [npm, --prefix, '${webRoot}', install]
