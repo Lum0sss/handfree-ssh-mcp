@@ -7,6 +7,22 @@ import { ToolError } from "../utils/tool-error.js";
 const execFileAsync = promisify(execFile);
 type Target = {plugin: string; component?: string; connectionName?: string};
 type ExecuteLocal = (argv: string[], env: Record<string, string>, timeout: number) => Promise<string>;
+function powershellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "''") + "'";
+}
+
+function sshCommand(argv: string[], env: Record<string, string>, shell: string): string {
+  if (shell === "powershell") {
+    const assignments = Object.entries(env).map(([key, value]) => `$env:${key} = ${powershellQuote(value)};`).join(" ");
+    const invoke = `& ${argv.map(powershellQuote).join(" ")}`;
+    const script = `$ErrorActionPreference = 'Stop'; try { ${assignments} ${invoke}; if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE } exit 0 } catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }`;
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+  }
+  if (shell !== "posix") throw new ToolError("INVALID_CONFIGURATION", `Unknown plugin commandShell: ${shell}`);
+  return [...(Object.keys(env).length ? ["env", ...Object.entries(env).map(([k,v]) => `${k}=${v}`)] : []), ...argv].map(shellQuote).join(" ");
+}
+
 const localExec: ExecuteLocal = async (argv, env, timeout) => {
   const result = await execFileAsync(argv[0], argv.slice(1), {
     env: {...process.env, ...env}, timeout, maxBuffer: 1024 * 1024, windowsHide: true,
@@ -41,7 +57,7 @@ export class PluginHost {
     let output: string;
     try {
       if (c.connectionName) {
-        const command = [...(Object.keys(env).length ? ["env", ...Object.entries(env).map(([k,v]) => `${k}=${v}`)] : []), ...argv].map(shellQuote).join(" ");
+        const command = sshCommand(argv, env, variables.commandShell ?? "posix");
         // Use the existing manager, including its command policy, timeout and output limits.
         // Mutations are never automatically retried after an ambiguous SSH disconnect.
         output = await this.ssh.executeCommand(command, c.connectionName, {timeout, maxRetries: 0, maxOutputBytes: 1024 * 1024});
@@ -69,7 +85,7 @@ export class PluginHost {
     }, 30000, name ? {skill: name} : {});
   }
 
-  async activate(target: Target, mode: "check" | "install" | "update" = "check") {
+  async activate(target: Target, mode: "check" | "install" | "update" = "check", timeout = 300000) {
     const c = this.context(target);
     const key = `${target.plugin}/${c.component.id}/${c.connectionName ?? "local"}`;
     if (this.mutations.has(key)) throw new ToolError("COMMAND_EXECUTION_ERROR", "Plugin maintenance is already in progress", true);
@@ -77,7 +93,7 @@ export class PluginHost {
       if (mode !== "check") {
         const command = c.component[mode];
         if (!command) throw new ToolError("INVALID_CONFIGURATION", `No ${mode} command configured for this component`);
-        await this.execute(target, () => command, 300000);
+        await this.execute(target, () => command, timeout);
       }
       const version = await this.execute(target, ctx => ctx.component.version);
       const skills = c.component.skills ? await this.skill(target) : null;

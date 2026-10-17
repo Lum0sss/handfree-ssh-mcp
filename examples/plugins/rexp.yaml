@@ -5,6 +5,19 @@ components:
   - id: worker
     target: ssh
     description: Run lab on the selected SSH server. File transfer uses SSH MCP SFTP tools.
+    setup: |
+      安装前确认目标节点、平台安装环境和数据根目录 platformRoot。已有路径优先保留；
+      未指定的目录和初始化选项应询问用户，只有明确授权“看着办”时才自行选择，
+      并说明最终位置、磁盘容量与选择理由。不要在源码、临时目录或 cache 下散放安装与实验数据。
+      先检查 Conda 及现有环境；平台可使用独立的 Conda 命名环境，按目标系统设置
+      platformPython、labPath（Windows 通常为 Scripts/lab.exe）及 commandShell: powershell。
+      插件本体从 TestPyPI 安装 rexp-server，依赖从 PyPI 获取；不要用临时 wheel 链接替代清单来源。
+      安装完成后读取 platform-operations skill，再初始化用户确认的数据根目录。
+      安装成功不代表实验就绪：检查 lab node env list --json 和 conda env list --json，
+      至少登记一个可用实验环境，优先复用与平台运行环境不同的兼容环境。
+      新环境的 Python/依赖由实验要求决定，要求不清楚时询问用户；未经委托不要猜测科研依赖。
+      若无 default 注册名，实验配置必须显式指定已登记 environment，不能默默使用平台 Python。
+      最后用 lab doctor --json 检查；未登记实验环境应报告初始化尚未完成，不自动启动调度器。
     source:
       kind: pip
       location: https://test.pypi.org/simple/

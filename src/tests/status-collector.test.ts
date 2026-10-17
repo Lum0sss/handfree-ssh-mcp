@@ -140,6 +140,28 @@ describe("collectSystemStatus hang-hardening", () => {
     assert.strictEqual(status.reachable, true);
     assert.strictEqual(status.hostname, "partial-host");
   });
+
+  it("falls back to Windows and remembers the successful shell on the SSH connection", async () => {
+    const commands: string[] = [];
+    const client = makeClient((cmd, channel) => {
+      commands.push(cmd);
+      if (!cmd.startsWith("powershell.exe")) {
+        channel.stderr.emit("data", Buffer.from("sh is not recognized"));
+        channel.finish(1);
+      } else {
+        channel.writeStdout("__STATUS_BEGIN__\r\nHOSTNAME=laptop\r\nOS_NAME=Windows\r\nGPUS=NVIDIA|RTX 3060|42;NVIDIA|RTX 3060|0\r\n__STATUS_END__");
+        channel.finish();
+      }
+    });
+    const status = await collectSystemStatus(client, "windows", { timeoutMs: 2000 });
+    assert.equal(status.reachable, true);
+    assert.equal(status.osName, "Windows");
+    assert.equal(status.gpus?.length, 2);
+    assert.equal(status.gpus?.[0].usage, "42.0%");
+    await collectSystemStatus(client, "windows", { timeoutMs: 2000 });
+    assert.equal(commands.length, 3);
+    assert.ok(commands[2].startsWith("powershell.exe"));
+  });
 });
 
 describe("refreshStatus connect/probe budgets", () => {

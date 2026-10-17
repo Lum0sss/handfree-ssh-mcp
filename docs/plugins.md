@@ -12,6 +12,9 @@ The optional registry defaults to `~/.config/handfree-ssh-mcp/plugins.yaml`
 A missing registry means no plugins. An invalid registry returns a structured error
 when queried; ordinary SSH tools remain available. Files are reread on every plugin
 request, so restart is unnecessary after changing a manifest.
+Adding a plugin or installing it on another connected node uses the same fixed
+generic MCP tools: no client tool-list refresh or Codex restart is needed. SSH node
+files are watched by the core; Web observes changes on its next normal refresh.
 
 Copy `examples/plugins/registry.example.yaml` and the manifests you need to that
 personal configuration directory, then edit your paths. Do not store personal
@@ -50,6 +53,10 @@ A component declares `id`, `target` (`local` or `ssh`), `description`, `entry` a
 
 - `source`: `kind`, `location`, optional `package`, for discovery. Downloads are done
   by the explicit `install`/`update` argv commands, **not inferred from a URL**.
+- `setup`: optional installation and initialization instructions, returned by
+  `plugin-list` before the program is installed. Resolve user-specific paths and
+  initialization choices before installation; ask unless already supplied or explicitly
+  delegated. A successful package install does not imply the plugin is ready for use.
 - `install` / `update`: package manager argv arrays. Missing actions fail clearly.
 - `env`: environment variables for every command, including install and version.
 - `skills.list` / `skills.show`: commands returning the current catalog and one skill;
@@ -64,19 +71,25 @@ literally, without interpolation. No arbitrary JavaScript modules are loaded.
 For REXP, keep `platformRoot`, `labPath` and `platformPython` per server. The root is
 passed through `PLATFORM_ROOT`; omitting a required root fails instead of selecting an
 arbitrary directory. Existing roots are not initialized, migrated or deleted by activation.
-The example assumes an existing Python installation (such as Conda base); it does not
-install Conda or create experiment environments. It requires a REXP release with
+The example assumes an existing Python installation; an agent may select a dedicated
+Conda platform environment after resolving setup choices with the user. It does not
+install Conda or silently create experiment environments. REXP setup requires at least
+one registered compatible experiment environment, preferably separate from the platform
+runtime; inspect existing Conda environments before creating one. It requires a REXP release with
 `lab skills list/show`; upgrading Handfree alone does not add that interface to old workers.
 The TestPyPI example is a development source; change installer argv for production.
 
 ## Execution and lifetime
 
 Local commands use `execFile` without a shell. Remote argv and environment values
-are individually POSIX-quoted, then executed through the existing SSH manager. Existing
-command policies apply to the **complete quoted command**, including `env`; a whitelist
-for an unquoted bare executable might need a deliberate adjustment. Handfree never
-relaxes that policy. SFTP continues to use existing upload/download/transfer tools and
-path policies. This first remote adapter requires a POSIX shell.
+are individually POSIX-quoted by default. For a Windows SSH target whose default shell
+is `cmd.exe`, set `commandShell: powershell` in that connection's plugin registry settings.
+The host then uses PowerShell's encoded command form so paths, arguments and environment
+values remain literal. Existing command policies apply to the complete command, including
+`env` on POSIX hosts or `powershell.exe` on Windows. Handfree never relaxes that policy.
+Policies inspect the submitted shell command, not the decoded contents of PowerShell's
+encoded script. They are not an argv-level sandbox for the plugin program.
+SFTP continues to use existing upload/download/transfer tools and path policies.
 
 CLI outputs are returned as `{plugin,component,target,connectionName,output}`. Errors
 use existing MCP `isError` / code / message / retriable conventions. Output is limited
@@ -85,7 +98,10 @@ Remote exit errors are detected from the existing manager's exit markers; this i
 new transport protocol. A disconnected mutation is not retried automatically, since the
 remote operation might already have happened. Check its state before retrying.
 Normal command timeout defaults to 30 seconds (configurable up to 5 minutes through
-the tool); maintenance uses 5 minutes. A timeout/disconnect may leave a partially
+the tool); maintenance defaults to 5 minutes. `plugin-activate.timeout` can explicitly
+allow up to 30 minutes for a slow dependency installation; the MCP client request must
+also allow that duration. Preserve the manifest's package source instead of replacing
+it with an ad hoc wheel URL. A timeout/disconnect may leave a partially
 completed installation and cannot be rolled back by Handfree. Maintenance is serialized
 per component/host in one MCP process; it is not a distributed package manager lock.
 
@@ -100,13 +116,15 @@ update source or skill endpoint, so neither is fabricated by this manifest.
 ## Development verification
 
 `npm run test:plugins` covers local execution, literal argv, SSH alias and root selection,
+Windows PowerShell command encoding,
 policy failures, installer failure, rereading skills after updates, component selection,
 concurrent maintenance and timeouts. Existing SSH tests remain separate.
 
 
 ### Validation for this implementation
 
-- Plugin tests: 6 passed, including an actual MCP client/server exchange.
+- Plugin and status tests: 14 passed, including an actual MCP client/server exchange,
+  Windows probe fallback and installer timeout forwarding.
 - Full suite: 739 passed, 3 failed, 11 skipped in the run including the first five
   plugin tests. The three failures were reproduced from a clean archive of origin/main
   (290c446): one missing-authentication assertion and two direct-transfer host-key fixtures.
@@ -115,5 +133,6 @@ concurrent maintenance and timeouts. Existing SSH tests remain separate.
   was started and no remote worker was updated.
 - Package dry run includes the new host and example manifests, excludes private SSH
   configuration and the former REXP JavaScript adapter.
-- Existing Web continues to use its independent stable runtime. It has not yet migrated
-  its business calls to this new generic plugin API.
+- REXP Web uses `plugin-run` with `runs --json` and `run show --json`; pass both
+  `--config` and `--plugins` when starting its MCP child. Its personal configuration
+  selects the same node and plugin registries as the agent.

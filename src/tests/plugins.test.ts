@@ -43,6 +43,9 @@ test("optional user registry, missing argument, strict manifest and required set
     assert.throws(() => manifestSchema.parse({...f.manifest, components:[...f.manifest.components,...f.manifest.components]}), /Duplicate/);
     assert.throws(() => manifestSchema.parse({...f.manifest, unexpected: true}));
     assert.throws(() => f.catalog.resolve("missing"), /Unknown/);
+    f.manifest.components[0] = {...f.manifest.components[0], setup:"Ask for the data directory before initialization."} as any;
+    fs.writeFileSync(path.join(f.dir,"manifest.json"),JSON.stringify(f.manifest));
+    assert.match(f.catalog.read()[0].manifest.components[0].setup!, /Ask for the data directory/);
     f.registry.plugins.demo = {...f.registry.plugins.demo, enabled:false} as any;
     fs.writeFileSync(f.file,JSON.stringify(f.registry));
     assert.deepEqual(f.catalog.read(),[]);
@@ -80,8 +83,30 @@ test("SSH targets follow manager aliases, quote every argument and keep per-host
     assert.match(calls[0][0], /PLATFORM_ROOT=\/alpha/); assert.match(calls[1][0], /PLATFORM_ROOT=\/beta/);
     assert.equal(calls[0][2].maxRetries,0);
     assert.ok(calls[0][0].endsWith(shellQuote("a' ; $(no)")));
+    await host.activate({plugin:"demo",connectionName:"alpha"},"install",900000);
+    assert.equal(calls[2][2].timeout,900000);
     const value="中文 '; $(printf broken)\nsecond";
     assert.equal(execFileSync("/bin/sh",["-c",`printf %s ${shellQuote(value)}`],{encoding:"utf8"}),value);
+  } finally {f.clean();}
+});
+
+test("PowerShell SSH targets encode arguments and per-host environment for Windows", async () => {
+  const f=fixture("ssh");
+  const calls: any[]=[];
+  f.registry.plugins.demo.connections.alpha={platformRoot:"D:\\research's", commandShell:"powershell"} as any;
+  fs.writeFileSync(f.file,JSON.stringify(f.registry));
+  const ssh={resolveServer:(name?:string)=>name,
+    executeCommand:async (...args:any[])=>{calls.push(args); return "ok";}} as unknown as SSHConnectionManager;
+  try {
+    const host=new PluginHost(f.catalog,ssh);
+    await host.run({plugin:"demo",connectionName:"alpha"},["中文 '; $(no)"]);
+    const command=calls[0][0] as string;
+    assert.match(command,/^powershell\.exe -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+    const script=Buffer.from(command.split(" ").at(-1)!,"base64").toString("utf16le");
+    assert.match(script,/\$env:PLATFORM_ROOT = 'D:\\research''s'/);
+    assert.match(script,/'中文 ''; \$\(no\)'/);
+    assert.match(script,/exit \$LASTEXITCODE/);
+    assert.equal(calls[0][1],"alpha");
   } finally {f.clean();}
 });
 

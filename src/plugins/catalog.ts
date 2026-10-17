@@ -12,6 +12,7 @@ export const componentSchema = z.object({
   id: z.string().regex(/^[a-z][a-z0-9-]*$/),
   target: z.enum(["local", "ssh"]),
   description: z.string(),
+  setup: word.optional(),
   entry: argv,
   version: argv,
   source: z.object({ kind: z.string(), location: z.string(), package: z.string().optional() }).strict().optional(),
