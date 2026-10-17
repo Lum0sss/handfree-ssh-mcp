@@ -97,8 +97,8 @@ to 1 MiB per stream (SSH), 1 MiB combined (local); detected truncation is an err
 Remote exit errors are detected from the existing manager's exit markers; this is not a
 new transport protocol. A disconnected mutation is not retried automatically, since the
 remote operation might already have happened. Check its state before retrying.
-Normal command timeout defaults to 30 seconds (configurable up to 5 minutes through
-the tool); maintenance defaults to 5 minutes. `plugin-activate.timeout` can explicitly
+Normal command timeout defaults to 30 seconds (configurable up to 30 minutes through
+the tool for explicit long setup operations); maintenance defaults to 5 minutes. `plugin-activate.timeout` can explicitly
 allow up to 30 minutes for a slow dependency installation; the MCP client request must
 also allow that duration. Preserve the manifest's package source instead of replacing
 it with an ad hoc wheel URL. A timeout/disconnect may leave a partially
