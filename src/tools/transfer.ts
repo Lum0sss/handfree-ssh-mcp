@@ -50,13 +50,13 @@ export function registerTransferTool(server: McpServer): void {
         "Remote-to-remote: absolute destination POSIX path, subject to destination path policy.",
       ),
       strategy: transferStrategySchema.optional().describe(
-        "Remote-to-remote only: relay (default) uses this MCP host via SFTP; direct runs rsync or tar|ssh on the source; auto tries direct then falls back with a reason. Direct requires source-to-destination reachability and existing key/host-key trust; keys are never copied or auto-accepted.",
+        "Remote-to-remote only: relay (default) uses this MCP host via SFTP, except that a same-server copy is done by the server itself when its SFTP advertises copy-data (OpenSSH 9.0+; connections is then ignored); direct runs rsync or tar|ssh on the source; auto tries direct then falls back with a reason. Direct requires source-to-destination reachability and existing key/host-key trust; keys are never copied or auto-accepted.",
       ),
       recursive: z.boolean().optional().describe(
         "Upload/download directory tree, default false. Not combinable with batch.",
       ),
       skipIfIdentical: z.boolean().optional().describe(
-        "Default true: skip matching uploads or relays. Upload compares content, ignoring shell-script CRLF/LF differences; relay checks size+MD5 when available. Downloads are never skipped.",
+        "Default true: skip matching uploads or relays. Upload skips only when the remote MD5 (computed on the server) equals the MD5 of the bytes to be written, after the shell-script CRLF to LF fix; no remote hash command means upload. Relay checks size+MD5 when available. Downloads are never skipped.",
       ),
       reuseConnection: z.boolean().optional().describe(
         "Default true. Set false to use a fresh SSH connection after a suspected stale connection.",
@@ -68,7 +68,7 @@ export function registerTransferTool(server: McpServer): void {
         "Default false. Include bounded SSH debug output; fresh handshake logs also require reuseConnection=false.",
       ),
       fast: z.boolean().optional().describe(
-        "Default true for upload/download: parallel SFTP chunks. False uses buffered transfer. Relay uses bounded parallel read-ahead independently of fast.",
+        "Default true for upload/download: pipelined SFTP chunks. False is a serial compatibility mode and is much slower. Relay uses bounded parallel read-ahead independently of fast.",
       ),
       sftpConcurrency: z.number().int().positive().optional().describe(
         "Upload/download with fast=true: concurrent SFTP chunks. Relay: prefetched chunks, default 64; total window at most 64 MiB.",

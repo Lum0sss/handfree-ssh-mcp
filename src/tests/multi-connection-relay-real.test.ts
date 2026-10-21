@@ -255,7 +255,11 @@ describe("multi-connection relay real execution", { concurrency: false }, () => 
     });
     assert.equal(result.isError, undefined, responseText(result));
     assert.equal(sha256(fs.readFileSync(source.toLocalPath("/self-out.bin"))), sha256(data));
-    assert.equal(source.stats.connectionCount, 3, "self-relay: one connection per pair, carrying both a read and a write channel");
+    // 3 transfer lanes (one connection per pair, each carrying both a read and
+    // a write channel -- not 2N) plus the one cached connection the same-server
+    // copy-data probe opens first (this server does not advertise copy-data, so
+    // the multi-connection relay then runs as before).
+    assert.equal(source.stats.connectionCount, 3 + 1, "self-relay: one connection per pair (+1 cached probe connection)");
   });
 
   test("black-box: a file smaller than the pair count and an empty file both land correctly", async () => {

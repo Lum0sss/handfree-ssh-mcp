@@ -1266,6 +1266,203 @@ PLAN 正文 §2 要的是「多连接单文件分片」，`PLAN.MD:81` 甚至专
 
 口径说明：P1-04e/f 与 P1-06 表格里的多连接数字都含每次约 0.7 s 建连，对应现在的「首次调用」。上传与 relay 在 `8` 仍不比 `4` 快，原因仍未定位。
 
+### P1-06c 传输正确性与性能修复（2026-10-21 立项）
+
+**约束（用户原话）**：「禁止自己造轮子，能胶水就胶水」「禁止不停 patch，要把代码改成真正正确的代码」。据此，本节每一项都必须：
+- 落在已有库能力上：ssh2 的 `fastGet`/`fastPut`/`ext_copy_data`、Node `crypto`、远端 coreutils；
+- 删除被取代的旧路径，而不是在旁边再加一条；
+- 不保留「以防万一」的兼容分支，`fast:false` 这种对用户公开的逃生口除外。
+
+#### 0. 已证实的问题（证据）
+
+真实 ssh2 fixture，每个 READ 回复延迟 20 ms，4 MiB 文件：
+
+| 场景 | 耗时 |
+|---|---|
+| `download` 不传 `fast`（workspace-run collect 的实际调用方式） | 5862 ms |
+| `download`，`fast: true`（download 工具的调用方式） | 309 ms |
+| 覆盖同大小文件，skipIfIdentical 默认开 | 6079 ms |
+| 同上，`skipIfIdentical: false` | 194 ms |
+
+根因：
+- **B1 `fast` 默认值分层不一致**：工具层是 `fast !== false`（`tools/upload.ts:50`、`download.ts:38`、`transfer.ts:200`），服务层是 `options?.fast === true`（`transfer-service.ts:1196`、`:1917`）。`run-service.ts` 的 push（`:344` uploadBatch、`:367` uploadDirectory）和 collect（`:689` download）都不传 `fast`，于是走串行路径。
+- **B2 同大小文件的 skip 判定把远端整个文件读过网络**：`filesMatchByStreamingHash`（`:1584`）和 `sftpReadBuffer`（`:1658`）都用 `sftp.createReadStream`。ssh2 1.17.0 的 ReadStream 同一时刻只有一个 READ 在途（`SFTP.js:3724`），ssh2 的 `write`/`writeFile` 也是一块确认后才发下一块（`SFTP.js:422-497`、`writeAll :2393`）。ssh2 里只有 `fastXfer`（`:2185`，64 × 32 KiB）是流水线化的。
+- **B3 每个文件单独开 SFTP 会话**：`upload()` 先为 stat 开一次会话，fastPut 再开一次；递归/批量每个文件都调用单文件 `upload()`/`download()`；`listRemoteDir` 每个目录开一次会话；collect 串行逐文件下载。
+- **B4 `execCapture` 从不关闭 stdin**：任何会读 stdin 的远端命令都会一直等下去。目前没触发，只是因为现有命令都不读 stdin。
+- **B5 同服务器 relay 字节绕行本机两次**：源与目标是同一台服务器时，数据仍要经本机下载再上传。
+
+#### 1. 调研结论（来源）
+
+| 问题 | 参考做法 | 来源 |
+|---|---|---|
+| 流水线 | 所有参考实现都默认多请求在途：OpenSSH sftp 默认 64 请求 × 32 KiB，并逐步爬升；pkg/sftp 每文件 64 并发；rclone 默认并发读写，文档写明关闭会显著降速；ssh2 `fastXfer` 64 × 32 KiB | `sftp-client.c:60-63`、`:1820-1830`；pkg/sftp `client.go:245`；rclone `backend/sftp/sftp.go:365-395` |
+| 判定相同 | 协议层的 `check-file-handle`/`check-file-name`（服务端算哈希）只存在于 2006 年过期的草案；OpenSSH `sftp-server.c` 只声明 9 个扩展，没有它；ssh2 也未实现，故不可用 | draft-ietf-secsh-filexfer-extensions-00 §3；`sftp-server.c:154-167`、`:717-725` |
+| 判定相同 | rclone：先比大小，再比 mtime，最后在远端执行哈希命令。候选命令按序探测（`md5sum`、`md5 -r`、`rclone md5sum`），用空输入的已知哈希验证；解析时取第一字段并去掉前导 `\`；无可用命令时视为不同 | rclone `fs/operations/operations.go:128-345`；`backend/sftp/sftp.go:2124-2290`、`:2412-2470`、`parseHash :2576` |
+| 判定相同 | rsync：默认大小 + mtime；`-c` 时两端各在本机算校验和。共同原则：绝不为比较而把内容传过网络 | rsync `rsync.1.md:44-48`（quick check）、`:930-945`（`--checksum`：「both sides will expend a lot of disk I/O」，接收方在本机为同大小文件算校验和） |
+| 会话复用 | OpenSSH sftp 一个会话处理整批文件；rclone 有 SFTP 连接池（`getSftpConnection`/`putSftpConnection`），跨文件复用 | rclone `backend/sftp/sftp.go:2085-2122` |
+| 服务端复制 | OpenSSH 9.0（2022-03-31 `3fa539c3ff`）起支持 `copy-data`：服务端单线程同步拷贝，一个请求拷到底。OpenSSH 自带 `sftp cp` 只发一个 `len=0` 请求。2026-05-31（`5a5e47740b`）起才拒绝读写同一 inode，更早的版本不检查。ssh2 已实现 `ext_copy_data`（`SFTP.js:1609`）。实验室镜像 debian:12 带 OpenSSH 9.2，支持 | `PROTOCOL` 4.10；`sftp-server.c` `process_extended_copy_data` |
+| stdin | Go `ssh.Session.Run` 不设 Stdin 时远端立即收到 EOF。rclone 的探测命令（不带参数的 `md5sum`）依赖这一点 | rclone `sftp.go:2085-2122` |
+
+不采用的方案：
+- **大小 + mtime 快速判定**：会把我们「内容一致才跳过」的承诺降级；而且我们上传时不保留 mtime，判定对现有文件不成立。今后若需要，作为显式选项另立任务。
+- **WASM / 其他胶水形式的哈希库**：本地 MD5 由 Node `crypto` 原生实现（OpenSSL）。远端只能用对方已安装的命令，coreutils 普遍有 `md5sum`，没有 `b3sum`/`xxhsum`，换算法没有收益。
+- **QUIC 传输**：远端是 sshd/TCP，换传输需要在远端部署代理并开放 UDP，属于架构改变，不在本节。
+- **放大 ssh2 接收窗口、中转读写解耦**：需要先在实验室拿到收益证据，另立 P1-06d。
+
+#### 2. 设计
+
+**W1 流水线默认值（B1）**
+- 服务层 `upload`/`download` 的 `fast` 改为 `options?.fast !== false`，与工具层、文档一致。所有内部调用方（push、collect、递归、批量、归档）随之走 `fastPut`/`fastGet`。
+- `fast:false` 保留为公开的兼容模式，作用与 rclone `disable_concurrent_*` 相同；文档写明它是串行的，会慢很多。
+
+**W2 skip-if-identical 改为远端哈希（B2、B4）**
+- 新的单一判定 `decideUploadSkip(client, sftp, server, remotePath, local)`，单连接上传和多连接上传共用：
+  1. 用调用方已有的 SFTP 会话 stat 远端；不存在或大小不同，就不跳过。
+  2. **并行**计算两边的 MD5：
+     - 远端在服务器本机执行哈希命令，不经网络传内容；
+     - 本地用 Node `crypto`：内存 payload 直接哈希，文件则流式读取。
+  3. 远端无可用哈希命令时**不跳过**，直接上传，原因写入 reason。语义与 rclone 相同，绝不回退成「把远端读过来比较」。
+- **哈希命令探测**照搬 rclone：
+  - 候选：`md5sum`、`md5 -r`、`rclone md5sum`；
+  - 验证：命令处理空输入，输出必须等于 `d41d8cd98f00b204e9800998ecf8427e`；
+  - 缓存：结果按服务器身份（名称 + host + port + user）缓存，含「不支持」；并发的首次探测共享同一个 Promise；
+  - 解析：按 rclone 的 `parseHash`。
+- **合并哈希函数**：`remoteMd5` 改为基于探测结果的 `remoteMd5(server, client, path)`。共有 5 处调用（两种 relay 的 skip 和校验、direct 校验），全部改用它，不留第二套哈希函数。
+- **B4 修在 helper 里**：把 `execCapture` 中「在给定 client 上 exec 并收集输出」的部分提取为 `execOnClient(client, command, timeoutMs, debug)`。打开 channel 后立即 `stream.end()` 发送 stdin EOF，行为与 Go `Session.Run` 一致。`execCapture` 改为「获取 client + `execOnClient`」，direct transfer 等现有调用一并受益。
+- **删除** `shouldSkipUpload`、`shouldSkipFastUpload`、`filesMatchByStreamingHash`、`sftpReadBuffer`、`SKIP_IF_IDENTICAL_HASH_THRESHOLD`，以及 shell 脚本的「换行无关比较」。
+- **语义变化（需写进文档）**：skip 判定的是「远端是否已经等于我们将要写入的字节」。
+  - 本地 CRLF、远端已是 LF：仍然跳过，因为修正后的 payload 是 LF。
+  - 远端是 CRLF、本地 LF：会重新上传，把远端改成 LF。这正是 CRLF 自动修正想要的结果。
+
+**W3 SFTP 会话复用（B3）**
+- 引入一个「传输作用域」（transfer scope）：
+  - 每个 worker 持有一个 SFTP 会话，懒打开；
+  - 出错时丢弃该会话，下一个文件重新打开；
+  - 每个文件先按服务器名取一次 client：缓存连接命中时开销为零，连接断了会重新建连，**保留现在批量 `onError=continue` 遇到断线后能自我恢复的行为**；
+  - `reuseConnection=false` 时整个调用共用一条一次性连接，调用结束关闭；不再是现在的每个文件一条。
+- 单文件核心函数 `uploadFileOn` / `downloadFileOn` 接收已打开的会话：stat、skip 判定、`fastPut`/`fastGet` 都在同一个会话上完成，不再自己开关会话。
+- 公开的 `upload()`/`download()` = 作用域（1 个 worker）+ 核心函数。
+- `uploadDirectory`/`uploadBatch`/`downloadDirectory`/collect 都改为作用域 + 有界 worker。worker 数 = `fileConcurrency`，channel 数上限不变。
+- **目录相关**：
+  - 目录遍历（`walkRemoteDirectory`）的 `readdir` 共用一个会话。SFTP 按 request id 复用，同一会话上可以并发多个 readdir。
+  - `sftpMkdirRecursive`/`sftpMkdirMany` 改为接收会话。
+  - 顺手删除 `walkRemoteDirectory` 里重复粘贴的注释。
+- **新增 `downloadFiles(pairs, server, options)`**：`downloadDirectory` 的文件阶段和 run-service 的 collect 共用（collect 改为有界并发）。基于现有的 `runBoundedTransfersWithResults(onError="abort")`，collect 仍能准确报告「已拉取」的清单。
+- `runBoundedTransfers*` 的 worker 回调增加 worker 序号参数，用来把会话绑定到 worker；`runBoundedTransfers` 本身不重写。
+
+**W4 同服务器 relay 走服务端 `copy-data`（B5）**
+- **触发条件**：
+  - `transferBetweenServers` 的源与目标是同一服务器；
+  - `strategy` 为 `relay`（默认）或 `auto`；
+  - SFTP 会话声明了 `copy-data`（ssh2 `_extensions['copy-data'] === '1'`，通过 ssh2 已公开的 `ext_copy_data` 调用）。
+  - 满足时忽略 `connections`，因为字节不过网络，多连接没有意义。`strategy: "direct"` 不受影响。
+- **步骤**：
+  1. skip 判定，复用 W2 的远端哈希；
+  2. 源以 `r` 打开，目标旁边新建临时文件，以 `w` 打开；
+  3. 按 **64 MiB** 分块顺序发 `ext_copy_data`，每块的回复都给 inactivity watchdog 计一次进度。不照搬 OpenSSH `cp` 的单个 `len=0` 请求，因为大文件会在 60 s 内没有任何进度回报，被误判超时；
+  4. 关闭两个句柄，校验大小 + md5；
+  5. 用 `replaceRemoteFile` 原子替换。任何一步失败都删除临时文件，目标保持原样。
+  - 由于总是写入新的临时 inode，即使是 2026-05-31 之前、没有同 inode 检查的 OpenSSH，也不可能对同一 inode 读写。
+- **不支持 `copy-data` 时**走现有 relay，行为不变。响应和 debug 中注明走的是哪条路径。
+
+#### 3. 测试（全部真实 SSH，无 mock；先写，先看到失败）
+
+fixture 新增：
+- `maxActiveReads`（READ 在途峰值，配合读延迟）；
+- `sftpChannelOpenCount`（累计打开的 SFTP channel 数）；
+- `execCommands` 日志；
+- `setHashCommandsAvailable(false)`：让 `md5sum`/`md5 -r`/`rclone md5sum` 返回 127。
+
+| 编号 | 用例 | 修复前预期失败点 |
+|---|---|---|
+| T1 | 服务层 `download`/`upload` 不传 `fast`：READ 或 WRITE 在途峰值 > 1 | 修复前峰值为 1 |
+| T2 | 覆盖同大小、内容不同的文件：目标文件上**零 READ**，执行过一次远端哈希，最终内容正确 | 修复前会 READ 整个文件 |
+| T3 | 远端已相同：零 READ、零 WRITE，响应为 skipped | 修复前有 READ |
+| T4 | 远端无哈希命令：直接上传，零 READ，reason 为 `remote-hash-unavailable` | 修复前会 READ |
+| T5 | 同一服务器第二次比较不重复探测：exec 日志里只有一次空输入探测 | 新行为 |
+| T6 | 空输入探测在 timeout 内完成（stdin 已 EOF） | 不关 stdin 就会挂住 |
+| T7 | 递归上传 24 个小文件、`fileConcurrency=4`：`sftpChannelOpenCount` ≤ 4 + 常数 | 修复前 ≥ 48 |
+| T8 | 递归下载同样的树：列目录共用一个会话，文件阶段 ≤ 4 个会话 | 修复前每目录、每文件各一个 |
+| T9 | collect 拉回多个产物的 SFTP channel 数有界，失败时「已拉取」清单准确 | 修复前每文件一个会话 |
+| T10 | CRLF：本地 CRLF、远端 LF → 跳过；远端 CRLF、本地 LF → 重新上传，结果为 LF | 第二条是语义变化 |
+| T11 | fixture 不声明 `copy-data` 时，同服务器 relay 走原路径，结果正确，debug 注明原因 | 回退路径 |
+| T12（Linux 门控，`.88` 真实 OpenSSH 9.2） | 同服务器 relay 走 `copy-data`：SFTP 层零 READ/WRITE 字节经过本机，校验通过；目标原内容在失败注入时保持不变 | 新行为 |
+
+- `command-validation.test.ts` 里 15 个替换内部方法的 skip/CRLF/fast 用例，改写为上表的真实用例；`sftp-stall-timeout.test.ts` 中针对已删除函数（`sftpReadBuffer`）的用例随函数删除，`sftpWriteBuffer`（`fast:false` 仍在用）的用例保留。
+- **变异验证**（每个都要确认编译进被测产物）：
+  - 服务层 fast 默认值改回 `=== true`；
+  - skip 判定恢复为读远端；
+  - 去掉 `stream.end()`；
+  - 恢复为每个文件开会话；
+  - 哈希命令探测不缓存；
+  - copy-data 改为单个 `len=0` 请求（配合短 timeout 和大文件，应被 watchdog 用例抓到）；
+  - 不支持 copy-data 时不回退。
+
+#### 4. 真机验收（`.88` netem lab，50 ms / 1 Gbps）
+
+- **benchmark 新增几行，只调用公开 API，修复前后的构建都能跑**：
+  1. 覆盖同大小文件上传（skip 默认开）；
+  2. 递归上传和递归下载各 500 个 4 KiB 小文件，`fileConcurrency=4`；
+  3. 同服务器 relay 128 MiB。
+- **先用 2.4.0 的构建测一遍基线，再测新构建**，两组数字都写入本节。
+- 未测出收益的项不得宣称有提速。
+
+#### P1-06c 执行结果（2026-10-21）
+
+**真机数字**：`.88` netem lab，50 ms / 1 Gbps，`--profile fixes`，单文件 32 MiB（不是上文写的 128 MiB；同服务器 relay 也是 32 MiB），1 次预热 + 3 次取中位数，每次都校验 SHA-256。两组构建使用同一 ssh2 1.17.0。
+
+| 项目 | 2.4.0 | 新构建 | 倍数 |
+|---|---|---|---|
+| 下载，不传 `fast`（服务层默认） | 26770 ms（1.20 MiB/s） | 1941 ms（16.48 MiB/s） | 13.8× |
+| 覆盖同大小文件上传（skip 默认开） | 28438 ms（1.13 MiB/s） | 1507 ms（21.23 MiB/s） | 18.9× |
+| 递归上传 500 × 4 KiB，`fileConcurrency=4` | 86992 ms | 32212 ms | 2.7× |
+| 递归下载 500 × 4 KiB，`fileConcurrency=4` | 58129 ms | 32948 ms | 1.8× |
+| 同服务器 relay | 2732 ms（11.71 MiB/s） | 894 ms（35.78 MiB/s） | 3.1× |
+
+- 2.4.0 的前两行正好是「一次只有一个 64 KiB 请求在途」的理论上限（64 KiB / 50 ms ≈ 1.25 MiB/s），证实 B1/B2。
+- 同服务器 relay 每次的响应都是 `server-side copy-data … no file data passed through the MCP host`（benchmark 日志逐次记录），即真实 OpenSSH 9.2 走了 W4。
+- 递归传输每个文件仍有约 5 个 RTT（stat、open、write、close 等），4 个 worker 下约 64 ms/文件；这是剩余的主要开销。
+
+**T12**（`.88` 上一次性 lab 容器，OpenSSH 9.2p1，非 root 用户）：5/5 通过。
+- 测试文件 72 MiB，超过一个 64 MiB copy-data 请求，以覆盖分块偏移。
+- 新增「temp 已写入后才失败」用例：目标是非空目录，rename 时报 EISDIR，验证 temp 被删、目录不变。原有「源不可读」用例在 temp 创建之前就失败，测不到清理。
+
+**变异验证**（每个都确认已进入被测产物并能解析）：
+- 本地 12 个，全部被抓到：
+  - 上传、下载的 fast 默认值改回 `=== true`；
+  - 忽略 md5 结果；
+  - 无哈希命令时跳过；
+  - 去掉 `stream.end()`；
+  - 探测不缓存；
+  - CRLF 场景用磁盘大小；
+  - 不复用会话；
+  - `reuseConnection:false` 时每个任务开一条连接；
+  - 不回退 copy-data；
+  - collect 把失败计为已拉取；
+  - 忽略 client 更换（W3c）：初版没有被抓到，补了用例「worker 的会话所在 client 被替换后在新 client 上重开」，限时 10 s，因为旧会话上的请求永远不会返回，不重开就会挂住。
+- 真实 OpenSSH 上 4 个：
+  - 目标偏移恒为 0：被抓到（md5 不符）；
+  - 不清理 temp：被抓到；
+  - 直接写目标：被抓到；
+  - **单个 `len=0` 请求：没有被抓到**。它的拷贝结果与分块相同，区别只是 watchdog 收不到进度，要用超过 60 s 的拷贝才测得出来，T12 没有这样做。这一项是已知未覆盖。
+
+**测试**：`npm test` 773 个，762 通过，0 失败，11 跳过，连续两次；`npm run test:package` 通过。
+- 内存用例（默认 fast 上传不预读文件）在整套运行中出现过一次误报：基线里混有之前用例留下的垃圾，测量期间被回收。现在先强制 GC 再取基线，并确认它仍能抓到「总是预读」的变异。
+
+**验收中补的修改**：batch、递归上传和 `downloadFiles` 在 `vvv` 下丢了每个文件的 debug 输出（相对 2.4.0 是回归），已恢复，并补了真实用例（先看到失败）。
+
+**未做**：
+- `collect-glob.ts` 枚举时每个匹配文件开一个 SFTP 会话（`statRemoteFile`），与 B3 同类，不在本节范围，留作后续。
+- 冷连接池时，同服务器 relay 为探测 copy-data 会多建 1 条缓存连接。
+
+#### 5. 文档与发布
+
+- 更新以下文档中的 skip 语义（远端哈希、无命令则上传、CRLF 规则）、`fast:false` 的说明、同服务器 copy-data：
+  - `src/tools/upload.ts`、`transfer.ts`、`help.ts`；
+  - SERVER_INSTRUCTIONS；
+  - `docs/transfer.md`、`docs/zh/transfer.md`。
+- 完整测试套件 → 版本 2.5.0（工作区里未提交的 2.4.1 改动包含在这次发布里）→ commit → `npm publish` → 用 registry curl 验证 → push 到 fork。
+
 
 ### P1-07 外部 engine 与远端执行 adapter
 

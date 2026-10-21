@@ -130,7 +130,14 @@ Parameters:
                   Batch mode (array localPath): this must be a directory;
                   each source lands at remotePath/<basename>.
   connectionName  (string, see below)  Target server name from list-servers.
-  skipIfIdentical (boolean, optional)  Default true. Skip when remote matches.
+  skipIfIdentical (boolean, optional)  Default true. Skip only when the remote
+                  file has the same size and the same MD5 as the bytes that
+                  would be written (after the shell-script CRLF->LF fix). The
+                  MD5 is computed on the server (md5sum, md5 -r or rclone
+                  md5sum, verified with empty input once per server); with no
+                  such command the file is uploaded, never read back to compare.
+                  Local CRLF + remote LF: skipped. Remote CRLF + local LF:
+                  re-uploaded as LF.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
                   or suspected stale cached SSH connection.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
@@ -139,6 +146,7 @@ Parameters:
                   for single-file results, relay results, and recursive errors.
   fast            (boolean, optional)  Default true. Use ssh2 fastPut for
                   single-file upload throughput. Not multi-file concurrency.
+                  false is a serial compatibility mode and is much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
   onError         (string, optional)   Batch mode only. "abort" (default): stop
@@ -200,6 +208,7 @@ Parameters:
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
   fast            (boolean, optional)  Default true. Use ssh2 fastGet for
                   single-file download throughput. Not multi-file concurrency.
+                  false is a serial compatibility mode and is much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
   connections     (number, optional)   Default 1 (default behavior). Above 1,
@@ -244,6 +253,11 @@ Modes:
             non-interactive SSH trust (never transfers a private key, never
             auto-accepts an unknown host key). strategy="auto" uses direct
             when possible, else falls back to relay and reports why.
+            Same server on both ends (relay/auto): when its SFTP server
+            advertises copy-data (OpenSSH 9.0+), the server copies the file
+            itself into a temp file next to the target (size + md5 verified,
+            then renamed into place), no bytes pass through this MCP host and
+            connections is ignored; otherwise the normal relay runs.
 
 Parameters for upload / download:
   mode            (string, required)   "upload" or "download"
@@ -255,9 +269,11 @@ Parameters for upload / download:
   recursive       (boolean, optional)  True to transfer a whole directory tree.
                   Not combinable with an array localPath.
   skipIfIdentical (boolean, optional)  Default true. Skip the transfer when the
-                  destination already matches the source. Upload: byte-compare
-                  for files <= 256 MiB, MD5 otherwise; shell scripts
-                  (.sh/.bash/.zsh) ignore CRLF<->LF differences. Relay: size +
+                  destination already matches the source. Upload: remote MD5
+                  (computed on the server, no content crosses the network) must
+                  equal the MD5 of the bytes to be written, i.e. after the
+                  .sh/.bash/.zsh CRLF->LF fix; no remote md5sum/md5 -r/rclone
+                  md5sum means upload. Relay: size +
                   md5sum on both servers when available, falling back to
                   transferring. Download is never skipped. Set false to force.
   archiveCompression (string, optional) Only with archive=true. One of "none"
@@ -268,7 +284,9 @@ Parameters for upload / download:
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
   fast            (boolean, optional)  Default true. upload/download only:
                   use ssh2 fastPut/fastGet for each file. Independent files
-                  are scheduled in parallel using fileConcurrency.
+                  are scheduled in parallel using fileConcurrency, each worker
+                  reusing one SFTP session. false is a serial compatibility
+                  mode and is much slower.
   sftpConcurrency (number, optional)   Upload/download with fast=true: concurrent
                   SFTP chunks. Relay: prefetched source chunks, default 64.
   chunkSize       (number, optional)   Bytes per chunk. Relay default 32768;

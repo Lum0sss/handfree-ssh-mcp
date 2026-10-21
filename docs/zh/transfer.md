@@ -12,8 +12,11 @@
 
 ## tar-before-transfer 与碎文件并发
 
-- `upload`、`download` 以及 `transfer` 的上传/下载模式现在默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`；需要兼容路径时可显式设置 `fast: false`。
-- 不使用 tar 的递归传输通过 `fileConcurrency` 并行处理独立文件，默认 4、最大 8。上限收紧是因为每个并发文件都会在同一 SSH 连接上打开各自的 SFTP channel，必须低于远端的 `MaxSessions`（OpenSSH 常见默认值为 10），否则会稳定触发 channel 打开失败。实现会先建立完整目录树，再并发传文件，主要用于降低大量碎文件的逐文件往返开销。
+- `upload`、`download` 以及 `transfer` 的上传/下载模式默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`，对所有调用方一致（包括 `workspace-run` 的 push 与 collect）。`fast: false` 是串行兼容模式：同一时刻只有一个请求在途，在有延迟的链路上会慢很多，除非服务器无法处理流水线请求，否则不要设置。
+- **上传的 skip-if-identical（默认开启）**：先 stat 远端文件（不存在或大小不同就上传）；大小相同时并行计算两端 MD5——远端由**服务器上的命令**计算（文件内容不经网络），本地用 Node `crypto`。远端命令按 rclone 的做法每台服务器探测一次：依次尝试 `md5sum`、`md5 -r`、`rclone md5sum`，输出等于空输入 MD5（`d41d8cd98f00b204e9800998ecf8427e`）的第一个被采用，结果（含「没有可用命令」）按服务器缓存。**远端没有可用的哈希命令时直接上传**，绝不为了比较而把远端文件读回本机。`skipIfIdentical: false` 强制上传。递归与批量上传逐文件使用同一判定。
+- **换行与 skip**：「相同」指远端字节等于将要写入的字节（即 CRLF 修正之后）。本地 `.sh` 含 CRLF、远端已是 LF：跳过；远端是 CRLF、本地是 LF：重新上传，远端随之变成 LF。非 shell 脚本不会被改写，CRLF 差异就是真实差异。
+- **同服务器 relay 走服务器自带的复制（`copy-data`）**：源与目标是同一台服务器、`strategy` 为 `relay`（默认）或 `auto`、且该服务器的 SFTP 声明了 `copy-data` 扩展（OpenSSH 9.0 及以上）时，由服务器自己复制，字节不再经本机往返。复制写入目标旁边的新临时文件，按 64 MiB 分块（每块都向 inactivity timeout 报告进度），校验大小与 MD5 后才替换目标；任何失败都会删除临时文件，目标保持原样。这条路径忽略 `connections`。服务器不支持 `copy-data` 时走原有 relay，`vvv: true` 时响应会说明原因。`strategy: "direct"` 不受影响。
+- 不使用 tar 的递归传输通过 `fileConcurrency` 并行处理独立文件，默认 4、最大 8。每个 worker 只打开一个 SFTP channel 并在它处理的所有文件间复用（某个文件失败会丢弃该 worker 的 channel，下一个文件重新打开；`reuseConnection: false` 时整次调用共用一条一次性连接），目录遍历也共用一个会话，channel 数不会超过 `fileConcurrency`。上限收紧是因为每个并发 worker 都会在同一 SSH 连接上打开各自的 SFTP channel，必须低于远端的 `MaxSessions`（OpenSSH 常见默认值为 10），否则会稳定触发 channel 打开失败。实现会先建立完整目录树，再并发传文件，主要用于降低大量碎文件的逐文件往返开销。
 - 设置 `archive: true` 后，源文件或目录会先自动打包为临时 tar，只传输一个归档文件，到目标目录后自动解包并清理本机及远端临时归档。源 basename 保持不变，无需再设置 `recursive: true`。
 - `archiveCompression` 可选 `none`（默认）、`gzip`、`bzip2`、`xz`、`zstd`。参与打包或解包的 MCP 宿主与远端服务器都必须具备对应的 `tar`/压缩支持。
 

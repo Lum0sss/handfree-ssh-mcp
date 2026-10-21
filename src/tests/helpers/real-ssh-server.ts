@@ -74,6 +74,21 @@ export interface RealSshServerStats {
   // last resetConnectionCount() -- a per-server connection budget is a bound
   // on exactly this.
   maxLiveConnections: number;
+  // PLAN.MD P1-06c: READ requests currently in flight (request received, reply
+  // not yet sent) and the peak since resetIoPeaks(). The READ-side twin of
+  // activeWrites/maxActiveWrites; with readResponseDelayMs it proves whether a
+  // download keeps more than one READ outstanding (pipelined) or only one
+  // (ssh2 ReadStream).
+  activeReads: number;
+  maxActiveReads: number;
+  // PLAN.MD P1-06c: cumulative number of SFTP channels (subsystem requests)
+  // accepted since resetSftpChannelOpenCount(). Unlike maxActiveSftpChannels
+  // this never decrements, so it counts channels opened-and-closed one after
+  // another -- the "one session per file" pattern.
+  sftpChannelOpenCount: number;
+  // PLAN.MD P1-06c: every exec command line received since resetExecLog(), in
+  // arrival order.
+  execCommands: string[];
 }
 
 const { Server } = ssh2;
@@ -151,6 +166,10 @@ export class RealSshTestServer {
     activeHandshakes: 0,
     maxActiveHandshakes: 0,
     maxLiveConnections: 0,
+    activeReads: 0,
+    maxActiveReads: 0,
+    sftpChannelOpenCount: 0,
+    execCommands: [],
   };
 
   public port = 0;
@@ -201,6 +220,15 @@ export class RealSshTestServer {
   // Connection indices whose SFTP subsystem requests are genuinely refused:
   // a connection that is still up but can no longer carry an SFTP channel.
   private rejectSftpForConnectionIndex: Set<number> | null = null;
+  // PLAN.MD P1-06c: false makes `md5sum`, `md5 -r` and `rclone md5sum` (with
+  // or without a path argument) exit 127 "command not found", like a host
+  // with no usable MD5 tool.
+  private hashCommandsAvailable = true;
+  // PLAN.MD P1-06c: while true, WRITE requests are received but never answered
+  // -- a connection that is up but whose peer has stopped acknowledging, the
+  // real-server stand-in for the dead-but-reused-connection stall the
+  // inactivity watchdog exists for.
+  private stallWrites = false;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -355,6 +383,7 @@ export class RealSshTestServer {
             // open/close so fileConcurrency-cap tests can observe the true
             // peak instead of trusting the client's own bookkeeping.
             this.stats.activeSftpChannels++;
+            this.stats.sftpChannelOpenCount++;
             this.stats.maxActiveSftpChannels = Math.max(
               this.stats.maxActiveSftpChannels,
               this.stats.activeSftpChannels,
@@ -423,6 +452,30 @@ export class RealSshTestServer {
    */
   public resetReadLog(): void {
     this.stats.readRequests.length = 0;
+  }
+
+  /** Reset the READ/WRITE in-flight peaks to the current in-flight counts. */
+  public resetIoPeaks(): void {
+    this.stats.maxActiveReads = this.stats.activeReads;
+    this.stats.maxActiveWrites = this.stats.activeWrites;
+  }
+
+  public resetSftpChannelOpenCount(): void {
+    this.stats.sftpChannelOpenCount = 0;
+  }
+
+  public resetExecLog(): void {
+    this.stats.execCommands.length = 0;
+  }
+
+  /** See stallWrites above. */
+  public setStallWrites(stalled: boolean): void {
+    this.stallWrites = stalled;
+  }
+
+  /** See hashCommandsAvailable above. */
+  public setHashCommandsAvailable(available: boolean): void {
+    this.hashCommandsAvailable = available;
   }
 
   /** Same reasoning as resetReadLog(), for the WRITE log. */
@@ -598,7 +651,10 @@ export class RealSshTestServer {
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       const buffer = Buffer.alloc(length);
+      this.stats.activeReads++;
+      this.stats.maxActiveReads = Math.max(this.stats.maxActiveReads, this.stats.activeReads);
       const respond = (error: NodeJS.ErrnoException | null, bytesRead: number): void => {
+        this.stats.activeReads--;
         if (error) return fail(requestId, error);
         if (bytesRead === 0) return sftp.status(requestId, STATUS_CODE.EOF);
         sftp.data(requestId, buffer.subarray(0, bytesRead));
@@ -615,6 +671,7 @@ export class RealSshTestServer {
       if (this.failWritesForConnectionIndex?.has(connectionIndex)) {
         return sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection write failure (test)");
       }
+      if (this.stallWrites) return;
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       this.stats.activeWrites++;
@@ -737,6 +794,7 @@ export class RealSshTestServer {
 
   private executeCommand(channel: any, command: string): void {
     this.stats.execCommandCount++;
+    this.stats.execCommands.push(command);
     if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
       channel.on("close", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL CLOSE\n`));
       channel.on("end", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL END\n`));
@@ -752,6 +810,15 @@ export class RealSshTestServer {
     } catch (error) {
       channel.stderr.write(`${(error as Error).message}\n`);
       finish(2);
+      return;
+    }
+
+    const isHashCommand = words[0] === "md5sum" || (words[0] === "md5" && words[1] === "-r")
+      || (words[0] === "rclone" && words[1] === "md5sum");
+    if (!this.hashCommandsAvailable && isHashCommand) {
+      channel.stderr.write(`${words[0]}: command not found
+`);
+      finish(127);
       return;
     }
 
