@@ -130,4 +130,26 @@ describe("P1-06c T12: same-server relay via copy-data on real OpenSSH (SKIPPED u
     assert.equal((await run(`cat ${root}/keep.bin`)).trim(), "original-target-content");
     assert.equal((await run(`ls -A ${root}`)).split(/\s+/).filter((name) => name.includes(".handfree-copy-")).length, 0);
   });
+  test("each 64 MiB request reports progress: a timeout of half the dd time still succeeds (self-calibrated)", async () => {
+    // Calibrate against the host itself: time a plain sequential copy of the
+    // same big file, then relay with an inactivity window of half of that. The
+    // chunked copy-data reports after every 64 MiB (far inside the window); a
+    // single len=0 request would be silent for about the whole dd time and
+    // trip the watchdog. All files live under the test root and are removed.
+    await run(`dd if=/dev/zero of=${root}/big.bin bs=1M count=1024 2>/dev/null`);
+    const startedAt = Date.now();
+    await run(`dd if=${root}/big.bin of=${root}/big-dd.bin bs=64k 2>/dev/null`);
+    const ddMs = Date.now() - startedAt;
+    await run(`rm -f ${root}/big-dd.bin`);
+    const timeout = Math.max(Math.floor(ddMs / 2), 200);
+
+    const message = await service.transferBetweenServers(SERVER, `${root}/big.bin`, SERVER, `${root}/big-copy.bin`, {
+      timeout,
+      skipIfIdentical: false,
+    });
+
+    assert.match(message, /server-side copy-data/, `dd took ${ddMs} ms, timeout was ${timeout} ms`);
+    assert.equal((await run(`stat -c %s ${root}/big-copy.bin`)).trim(), String(1024 * 1024 * 1024));
+    await run(`rm -f ${root}/big.bin ${root}/big-copy.bin`);
+  });
 });

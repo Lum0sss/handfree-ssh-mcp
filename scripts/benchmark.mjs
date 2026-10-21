@@ -230,6 +230,13 @@ const PROFILES = {
     warmups: 1,
     runs: 3,
   },
+  // P1-06c section 6 R1 sweep; same harness as `fixes`, small-file rows only.
+  smallfiles: {
+    name: "smallfiles",
+    fileBytes: 32 * 1024 * 1024,
+    warmups: 1,
+    runs: 3,
+  },
 };
 
 /** Pure. The P1-06c row set; see PROFILES.fixes. */
@@ -240,12 +247,27 @@ export function buildFixesGrid() {
     // The upload tool's own call (fast:true), overwriting a same-size file
     // with different content: the skip-if-identical check is on the clock.
     { label: "UPLOAD same-size overwrite (skip check on)", sameSizeOverwrite: true },
-    { label: "RECURSIVE upload 500 x 4 KiB", recursiveUpload: 500 },
-    { label: "RECURSIVE download 500 x 4 KiB", recursiveDownload: 500 },
+    { label: "RECURSIVE upload 500 x 4 KiB", recursiveUpload: 500, fileConcurrency: 4 },
+    { label: "RECURSIVE download 500 x 4 KiB", recursiveDownload: 500, fileConcurrency: 4 },
     // Source and destination are the same server: relayed through this host
     // before P1-06c, server-side copy-data after it.
     { label: "SELF-RELAY (same server)", selfRelay: true },
   ];
+}
+
+/**
+ * Pure. PLAN.MD P1-06c section 6 R1: files in flight vs small-file time, to
+ * pick the fileConcurrency default (smallest value within 10% of the best).
+ * Needs a build where fileConcurrency may exceed 8.
+ */
+export function buildSmallFilesGrid() {
+  const rows = [];
+  for (const fileConcurrency of [4, 8, 16, 32, undefined]) {
+    const tag = fileConcurrency === undefined ? "default" : `fc=${fileConcurrency}`;
+    rows.push({ label: `RECURSIVE upload 500 x 4 KiB ${tag}`, recursiveUpload: 500, fileConcurrency });
+    rows.push({ label: `RECURSIVE download 500 x 4 KiB ${tag}`, recursiveDownload: 500, fileConcurrency });
+  }
+  return rows;
 }
 
 /** Pure. */
@@ -471,7 +493,7 @@ function sha256OfSortedFiles(dir) {
  * PLAN.MD P1-06c section 4 rows. Every row verifies its result inside the
  * container or on this host -- a time for a wrong copy is not a measurement.
  */
-async function runFixesGrid({ svc, serverName, remotePath, expectedSha256, profile, scratchDir, conn, config, containerName, token, log }) {
+async function runFixesGrid({ grid, svc, serverName, remotePath, expectedSha256, profile, scratchDir, conn, config, containerName, token, log }) {
   const timeout = 1_800_000;
   const inContainer = async (command) => {
     const result = await conn.exec(
@@ -525,15 +547,15 @@ async function runFixesGrid({ svc, serverName, remotePath, expectedSha256, profi
       if (remoteSha !== sameSizeBSha) throw new Error("same-size overwrite: remote SHA-256 mismatch");
       return ms;
     },
-    recursiveUpload: async () => {
+    recursiveUpload: async (point) => {
       const remoteDir = `/home/labuser/data/small-up-${token}-${runIndex}`;
-      const ms = await timed(() => svc.uploadDirectory(smallLocal, remoteDir, serverName, { fast: true, fileConcurrency: 4, timeout }));
+      const ms = await timed(() => svc.uploadDirectory(smallLocal, remoteDir, serverName, { fast: true, fileConcurrency: point.fileConcurrency, timeout }));
       if (await sortedSha256InContainer(remoteDir) !== smallLocalSha) throw new Error("recursive upload: content mismatch");
       return ms;
     },
-    recursiveDownload: async () => {
+    recursiveDownload: async (point) => {
       const localDir = path.join(scratchDir, `small-down-${runIndex}`);
-      const ms = await timed(() => svc.downloadDirectory(smallRemote, localDir, serverName, { fast: true, fileConcurrency: 4, timeout }));
+      const ms = await timed(() => svc.downloadDirectory(smallRemote, localDir, serverName, { fast: true, fileConcurrency: point.fileConcurrency, timeout }));
       if (sha256OfSortedFiles(localDir) !== smallRemoteSha) throw new Error("recursive download: content mismatch");
       return ms;
     },
@@ -553,12 +575,12 @@ async function runFixesGrid({ svc, serverName, remotePath, expectedSha256, profi
   };
 
   const rows = [];
-  for (const point of buildFixesGrid()) {
+  for (const point of grid) {
     const kind = Object.keys(RUNNERS).find((key) => point[key]);
     const samples = [];
     for (let i = 0; i < profile.warmups + profile.runs; i += 1) {
       runIndex += 1;
-      const ms = await RUNNERS[kind]();
+      const ms = await RUNNERS[kind](point);
       if (i >= profile.warmups) samples.push(ms);
     }
     const bytes = kind === "recursiveUpload" || kind === "recursiveDownload" ? SMALL_FILES * SMALL_BYTES : profile.fileBytes;
@@ -805,8 +827,9 @@ async function main() {
     await waitForSshReady(config.host, lab.ports.source, "labuser", keypair.privateKeyPath, 60000, log);
     const transferService = manager.getTransferService();
 
-    if (profile.name === "fixes") {
+    if (profile.name === "fixes" || profile.name === "smallfiles") {
       const rows = await runFixesGrid({
+        grid: profile.name === "fixes" ? buildFixesGrid() : buildSmallFilesGrid(),
         svc: transferService, serverName, remotePath, expectedSha256, profile, scratchDir, conn, config, containerName, token, log,
       });
       modes = rows.map((r) => ({

@@ -24,6 +24,7 @@ import {
   type TransferLaneReservation,
 } from "../connection/ssh-connection-pool.js";
 import { SSHConfig } from "../models/types.js";
+import { MAX_FILE_CONCURRENCY } from "../contracts/transfer-contract.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError } from "../utils/tool-error.js";
 import { OutputCollector } from "../utils/output-collector.js";
@@ -359,16 +360,12 @@ export class TransferService {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let timer: NodeJS.Timeout | null = null;
-      // ssh2 fastPut/fastGet invokes `step` for every acknowledged chunk. At
-      // the default 32 KiB chunk size that can mean thousands of callbacks per
-      // second. Re-creating a JS timer for every callback eventually dominates
-      // the event loop and makes an otherwise healthy transfer slow down. A
-      // watchdog only needs a recent proof of life, so coalesce those resets.
-      const progressRearmIntervalMs = Math.min(
-        1_000,
-        Math.max(1, Math.floor(timeoutMs / 4)),
-      );
-      let lastArmedAt = 0;
+      // ssh2 fastPut/fastGet invokes `step` for every acknowledged chunk --
+      // thousands of times a second at 32 KiB chunks -- so progress only
+      // records a timestamp. One timer checks it when it fires and re-arms for
+      // the rest of the window, so the stall fires after exactly `timeoutMs`
+      // of real silence, never earlier.
+      let lastProgressAt = Date.now();
 
       const clear = () => {
         if (timer) {
@@ -377,33 +374,32 @@ export class TransferService {
         }
       };
 
-      const arm = () => {
-        clear();
-        lastArmedAt = Date.now();
-        timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          debug?.(`[mcp] ${description} stalled: no progress for ${timeoutMs}ms`);
-          try {
-            onTimeout?.();
-          } catch {
-            // Ignore cleanup failures after a stall.
-          }
-          reject(new ToolError(
-            "SSH_CONNECTION_FAILED",
-            `${description} stalled: no progress for ${timeoutMs}ms`,
-            true,
-          ));
-        }, timeoutMs);
+      const check = () => {
+        if (settled) return;
+        const idleMs = Date.now() - lastProgressAt;
+        if (idleMs < timeoutMs) {
+          timer = setTimeout(check, timeoutMs - idleMs);
+          return;
+        }
+        settled = true;
+        debug?.(`[mcp] ${description} stalled: no progress for ${timeoutMs}ms`);
+        try {
+          onTimeout?.();
+        } catch {
+          // Ignore cleanup failures after a stall.
+        }
+        reject(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `${description} stalled: no progress for ${timeoutMs}ms`,
+          true,
+        ));
       };
 
       const onProgress = () => {
-        if (!settled && Date.now() - lastArmedAt >= progressRearmIntervalMs) {
-          arm();
-        }
+        lastProgressAt = Date.now();
       };
 
-      arm();
+      timer = setTimeout(check, timeoutMs);
       start(onProgress).then(
         (value) => {
           if (settled) return;
@@ -441,14 +437,19 @@ export class TransferService {
   private static readonly DEFAULT_RELAY_SFTP_CONCURRENCY = 64;
   private static readonly DEFAULT_RELAY_SFTP_CHUNK_BYTES = 32 * 1024;
   private static readonly MAX_RELAY_PREFETCH_BYTES = 64 * 1024 * 1024;
-  private static readonly DEFAULT_RECURSIVE_FILE_CONCURRENCY = 4;
-  // Each concurrent worker opens its own SFTP channel (see upload/download),
-  // and every recursive transfer already holds one extra channel briefly for
-  // mkdir. OpenSSH's default `MaxSessions 10` bounds concurrently open
-  // channels on a single connection, so a cap above that reliably produces
-  // channel-open failures against a default-configured sshd. 8 leaves headroom
-  // under the common default instead of assuming operators raised it.
-  private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
+  // fileConcurrency is the number of FILES in flight, not the number of SFTP
+  // channels: many files share a few sessions (an SFTP session multiplexes
+  // requests by id, so one session carries many outstanding requests).
+  // Throughput of a small-file tree is in-flight files / round trips per
+  // file, so this is the lever. Default from the .88 lab sweep (PLAN.MD
+  // P1-06c section 6, 50 ms RTT, 500 x 4 KiB): upload 31.0 / 15.1 / 7.6 /
+  // 4.2 s at 4 / 8 / 16 / 32, download alike -- still near-linear at 32.
+  private static readonly DEFAULT_RECURSIVE_FILE_CONCURRENCY = 32;
+  private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = MAX_FILE_CONCURRENCY;
+  // SFTP sessions (channels) one multi-file call opens, at most. 4 is the
+  // former default channel count; it leaves room under OpenSSH's default
+  // `MaxSessions 10` for other concurrent calls on the same connection.
+  private static readonly MAX_SFTP_SESSIONS_PER_CALL = 4;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
 
   // Multi-connection single-file download and upload (see
@@ -456,7 +457,7 @@ export class TransferService {
   // extra channel on a shared connection -- the relevant remote limit is
   // sshd's MaxStartups (concurrent unauthenticated connection attempts), not
   // MaxSessions (channels per connection, which is what
-  // MAX_RECURSIVE_FILE_CONCURRENCY above is sized against). 8 is a
+  // MAX_SFTP_SESSIONS_PER_CALL above is sized against). 8 is a
   // conservative ceiling given MaxStartups' common default (10); operators
   // running many concurrent multi-connection downloads against the same host
   // may need to raise it.
@@ -909,10 +910,9 @@ export class TransferService {
   }
 
   /**
-   * Recursive directory transfer is dominated by per-file SFTP setup and
-   * round trips when a tree contains many small files. Keep a conservative
-   * default so the optimization remains safe for smaller SSH servers, but let
-   * callers tune it within a hard cap.
+   * Recursive directory transfer is dominated by per-file round trips when a
+   * tree contains many small files, so the number of files in flight is the
+   * tuning knob. Defaulted, and capped, in the constants above.
    */
   private resolveRecursiveFileConcurrency(options?: SftpOptions): number {
     const requested = this.optionalPositiveInteger(options?.fileConcurrency, "fileConcurrency");
@@ -925,6 +925,11 @@ export class TransferService {
       );
     }
     return concurrency;
+  }
+
+  /** SFTP sessions a multi-file call needs: no more than files in flight, no more than the per-call cap. */
+  private sftpSessionsFor(fileConcurrency: number): number {
+    return Math.min(fileConcurrency, TransferService.MAX_SFTP_SESSIONS_PER_CALL);
   }
 
   /**
@@ -1190,17 +1195,25 @@ export class TransferService {
    *   in the meantime the pool hands back a fresh client, the worker notices
    *   the client changed and opens a new session on it. That keeps a batch
    *   with onError=continue self-healing after a disconnect.
-   * - A task that fails discards its worker's session (it may be half-dead);
-   *   the next task opens a new one. A connection-shaped failure also drops
-   *   the cached client, exactly as the per-file code used to.
+   * - A connection-shaped failure (including the inactivity-watchdog stall)
+   *   discards the session and drops the cached client; the next task opens
+   *   a new session. A plain per-file SFTP status error keeps the session.
    * - reuseConnection=false opens ONE one-shot connection for the whole call
-   *   (shared by all workers, each with its own SFTP channel) and closes it
+   *   (shared by all workers; the call's few SFTP sessions ride on it) and closes it
    *   in close(); it used to be one connection per file.
    */
-  private openTransferScope(name: string, options: SftpOptions | undefined, debug: SshDebugSink | undefined): TransferScope {
+  private openTransferScope(
+    name: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+    sessions = 1,
+  ): TransferScope {
     const reuseConnection = options?.reuseConnection !== false;
     const timeout = options?.timeout;
-    const slots = new Map<number, { client: Client; sftp: SFTPWrapper }>();
+    // A session is shared by every worker mapped to it (worker % sessions),
+    // so it is created once: concurrent first users await the same open.
+    type Slot = { client: Client; ready: Promise<SFTPWrapper> };
+    const slots = new Map<number, Slot>();
     let oneShot: Promise<AcquiredSshClient> | null = null;
 
     const acquireClient = async (): Promise<Client> => {
@@ -1210,36 +1223,43 @@ export class TransferService {
       oneShot ??= this.pool.acquireSshClient(name, { reuseConnection: false, timeout, debug, purpose: "sftp" });
       return (await oneShot).client;
     };
-    const discard = (worker: number): void => {
-      const slot = slots.get(worker);
-      slots.delete(worker);
-      try { slot?.sftp.end(); } catch { /* already gone */ }
+    // Only the slot the caller used: another worker may already have replaced it.
+    const discard = (index: number, slot: Slot): void => {
+      if (slots.get(index) === slot) slots.delete(index);
+      slot.ready.then((sftp) => { try { sftp.end(); } catch { /* already gone */ } }, () => {});
     };
 
     return {
       run: async <T>(worker: number, task: (client: Client, sftp: SFTPWrapper) => Promise<T>, taskDebug?: SshDebugSink): Promise<T> => {
+        const index = worker % sessions;
+        let slot: Slot | undefined;
         try {
           const client = await acquireClient();
-          let slot = slots.get(worker);
+          slot = slots.get(index);
           if (slot && slot.client !== client) {
-            discard(worker);
+            discard(index, slot);
             slot = undefined;
           }
           if (!slot) {
-            slot = { client, sftp: await this.openSftp(client, `worker-${worker}`, timeout, taskDebug ?? debug) };
-            slots.set(worker, slot);
+            slot = { client, ready: this.openSftp(client, `session-${index}`, timeout, taskDebug ?? debug) };
+            slots.set(index, slot);
           }
-          return await task(slot.client, slot.sftp);
+          return await task(slot.client, await slot.ready);
         } catch (error) {
-          discard(worker);
-          if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-            this.pool.closeClient(name, true);
+          // A connection-shaped failure (or the inactivity-watchdog stall,
+          // which is one) means the session is unusable for everyone sharing
+          // it. A per-file SFTP status error (no such file, permission
+          // denied, EISDIR) says nothing about the session, and discarding it
+          // would kill the other files' in-flight requests.
+          if (this.pool.isConnectionError(error as Error)) {
+            if (slot) discard(index, slot);
+            if (reuseConnection) this.pool.closeClient(name, true);
           }
           throw error;
         }
       },
       close: async (): Promise<void> => {
-        for (const worker of [...slots.keys()]) discard(worker);
+        for (const [index, slot] of [...slots]) discard(index, slot);
         if (oneShot) {
           (await oneShot.catch(() => null))?.close();
         }
@@ -2450,6 +2470,48 @@ export class TransferService {
     return `auto strategy: direct transfer not possible (${probe.reason ?? "no usable direct backend"}); fell back to relay.\n${relayResult}`;
   }
 
+  /** Per-server copy-data support, negative result included; see detectRemoteHashCommand for the caching rules. */
+  private readonly copyDataSupport = new Map<string, Promise<boolean>>();
+
+  /**
+   * Whether the server's SFTP advertises copy-data. ssh2 exposes the
+   * advertised extensions only as the `_extensions` field of an open session
+   * (the typed ext_copy_data throws when it is not advertised), so the probe
+   * opens one session, reads it and closes it. Cached per server identity;
+   * concurrent first probes share one Promise; a probe that fails to run
+   * (connection error) is not cached.
+   */
+  private detectCopyData(name: string, options: SftpOptions | undefined, debug: SshDebugSink | undefined): Promise<boolean> {
+    const key = this.serverIdentity(name);
+    let detection = this.copyDataSupport.get(key);
+    if (!detection) {
+      detection = (async () => {
+        const connection = await this.pool.acquireSshClient(name, {
+          reuseConnection: options?.reuseConnection !== false,
+          timeout: options?.timeout,
+          debug,
+          purpose: "sftp",
+        });
+        try {
+          const sftp = await this.openSftp(connection.client, "copy-data-probe", options?.timeout, debug);
+          try {
+            return (sftp as unknown as { _extensions?: Record<string, string> })._extensions?.["copy-data"] === "1";
+          } finally {
+            try { sftp.end(); } catch { /* ignore late SFTP cleanup errors */ }
+          }
+        } finally {
+          connection.close();
+        }
+      })();
+      this.copyDataSupport.set(key, detection);
+      const pending = detection;
+      pending.catch(() => {
+        if (this.copyDataSupport.get(key) === pending) this.copyDataSupport.delete(key);
+      });
+    }
+    return detection;
+  }
+
   /**
    * Server-side file copy for a same-server transfer (PLAN.MD P1-06c W4):
    * the SFTP server copies the bytes itself via the copy-data extension
@@ -2483,16 +2545,14 @@ export class TransferService {
     let sftp: SFTPWrapper | null = null;
     let tempPath: string | null = null;
     try {
-      connection = await this.pool.acquireSshClient(name, { reuseConnection, timeout, debug, purpose: "sftp" });
-      const client = connection.client;
-      sftp = await this.openSftp(client, "copy-data", timeout, debug);
-      // ssh2 exposes the advertised extensions only as this field; the typed
-      // ext_copy_data throws when the server did not advertise it.
-      if ((sftp as unknown as { _extensions?: Record<string, string> })._extensions?.["copy-data"] !== "1") {
+      if (!(await this.detectCopyData(name, options, debug))) {
         debug?.(`[mcp] same-server transfer on [${name}]: server-side copy-data is not advertised by the SFTP server; using the client-side relay`);
         return null;
       }
       debug?.(`[mcp] same-server transfer on [${name}]: using server-side copy-data`);
+      connection = await this.pool.acquireSshClient(name, { reuseConnection, timeout, debug, purpose: "sftp" });
+      const client = connection.client;
+      sftp = await this.openSftp(client, "copy-data", timeout, debug);
 
       const sourceSize = (await this.sftpStat(sftp, sourcePath, "source")).size;
       if (options?.skipIfIdentical !== false) {
@@ -3438,6 +3498,12 @@ export class TransferService {
     return stdout.trimStart().replace(/^\\/, "").split(/\s+/)[0].toLowerCase();
   }
 
+  /** Cache key for per-server capability detection: a config reload that changes the host gets a fresh probe. */
+  private serverIdentity(serverName: string): string {
+    const config = this.pool.getConfig(serverName);
+    return `${serverName}|${config.host}|${config.port}|${config.username}`;
+  }
+
   /**
    * Find a hash command that works on this server (ported from rclone
    * backend/sftp/sftp.go checkHash): run each candidate with EMPTY stdin and
@@ -3446,8 +3512,7 @@ export class TransferService {
    * name exists. Resolves null when none works.
    */
   private detectRemoteHashCommand(serverName: string, client: Client, debug: SshDebugSink | undefined): Promise<string | null> {
-    const config = this.pool.getConfig(serverName);
-    const key = `${serverName}|${config.host}|${config.port}|${config.username}`;
+    const key = this.serverIdentity(serverName);
     let detection = this.remoteHashCommands.get(key);
     if (!detection) {
       detection = (async () => {
@@ -3890,7 +3955,7 @@ export class TransferService {
 
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     debug?.(`[mcp] sftp recursive upload on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
-    const scope = this.openTransferScope(resolvedName, options, debug);
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
     // File errors already carry their own per-file debug block; only the
     // setup phase (mkdir) reports through this call-level sink.
     let setupDone = false;
@@ -3963,7 +4028,7 @@ export class TransferService {
     const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
 
-    const scope = this.openTransferScope(resolvedName, options, debug);
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
     try {
       // Ensure the destination directory exists, mirroring uploadDirectory's
       // mkdir step. This is unconditional remote I/O and intentionally happens
@@ -4129,7 +4194,7 @@ export class TransferService {
    * the files through the same bounded worker pool every multi-file download
    * uses (`downloadPairs`). Discovery completes before any file transfer
    * starts, and the listing session is worker 0's session, so the whole call
-   * never holds more than `fileConcurrency` SFTP channels.
+   * never holds more than min(`fileConcurrency`, 4) SFTP channels.
    */
   public async downloadDirectory(
     remoteDir: string,
@@ -4148,7 +4213,7 @@ export class TransferService {
 
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     debug?.(`[mcp] sftp recursive download on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
-    const scope = this.openTransferScope(resolvedName, options, debug);
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
     // File errors already carry their own per-file debug block; only the
     // discovery phase reports through this call-level sink.
     let discovered = false;
@@ -4202,7 +4267,7 @@ export class TransferService {
 
   /**
    * Download many independent files from one server with bounded concurrency
-   * (`fileConcurrency`, default 4) over reused SFTP sessions. Never throws
+   * (`fileConcurrency`, default 32) over a few shared SFTP sessions. Never throws
    * for a failing file: every pair gets a status ("downloaded", "failed" with
    * a reason, or "not-attempted" because an earlier file failed), so a caller
    * such as workspace-run collect can report exactly what was already pulled.
@@ -4214,7 +4279,7 @@ export class TransferService {
   ): Promise<{ results: DownloadFileResult[] }> {
     const resolvedName = server || this.pool.defaultName;
     const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
-    const scope = this.openTransferScope(resolvedName, options, undefined);
+    const scope = this.openTransferScope(resolvedName, options, undefined, this.sftpSessionsFor(fileConcurrency));
     try {
       const outcomes = await this.downloadPairs(scope, resolvedName, pairs, fileConcurrency, options);
       return {

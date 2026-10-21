@@ -53,6 +53,7 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
     conn: new RealSshTestServer(path.join(suiteRoot, "conn")), // connection handling, stalls, skip basics
     slowWrite: new RealSshTestServer(path.join(suiteRoot, "slow-write"), 100), // progress keeps the watchdog alive
     instant: new RealSshTestServer(path.join(suiteRoot, "instant"), 0), // no artificial WRITE delay
+    sessions: new RealSshTestServer(path.join(suiteRoot, "sessions")), // section 6 R1: in-flight files vs SFTP channels
   };
 
   const write = (server: RealSshTestServer, remotePath: string, data: Buffer | string): void => {
@@ -88,6 +89,9 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
       ...servers,
       concurrentFirst: servers.skip,
       probeFresh: servers.skip,
+      copyProbe: servers.relay, // section 6 R3: fresh copy-data capability caches
+      copyProbe2: servers.relay,
+      copyProbe3: servers.relay,
     };
     manager.setConfig(
       Object.fromEntries(
@@ -106,6 +110,7 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
       Object.keys(targets),
     );
     servers.noHash.setHashCommandsAvailable(false);
+    servers.sessions.setOpenResponseDelayMs(20);
   });
 
   after(async () => {
@@ -584,6 +589,32 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
         await scope.close();
       }
     });
+
+    test("a refused SFTP session open is not cached: the next file on that session opens a new one", async () => {
+      // The server refusing the subsystem (as at its MaxSessions limit): the
+      // session slot caches the open, so a failed open has to be dropped, or
+      // every later file mapped to that session would fail with it. openSftp
+      // reports it as a connection error, which is what discards the slot.
+      // With reuseConnection:false the one-shot client is never replaced, so
+      // only that discard clears the slot; the cached-client case is also
+      // covered by the replaced-client check above.
+      write(servers.conn, "/scope-b.txt", "bb");
+      const stat = (sftp: unknown, remotePath: string) => (service as any).sftpStat(sftp, remotePath, "dest");
+      for (const reuseConnection of [true, false]) {
+        const scope = (service as any).openTransferScope("conn", { reuseConnection }, undefined, 1);
+        try {
+          servers.conn.rejectNextSftpRequests = 1;
+          await assert.rejects(() => scope.run(0, async (_client: unknown, sftp: unknown) => stat(sftp, "/scope-b.txt")));
+
+          const size = (await scope.run(0, async (_client: unknown, sftp: unknown) => stat(sftp, "/scope-b.txt"))).size;
+
+          assert.equal(size, 2, `reuseConnection=${reuseConnection}`);
+        } finally {
+          servers.conn.rejectNextSftpRequests = 0;
+          await scope.close();
+        }
+      }
+    });
   });
 
   describe("inactivity watchdog on the pipelined path", () => {
@@ -609,19 +640,47 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
       assert.match(message, /File uploaded successfully/);
     });
 
+    test("the stall fires only after the full window of silence, measured from the last progress", async () => {
+      // Progress 900 ms in, then 3500 ms of silence, against a 4000 ms window:
+      // never 4000 ms without progress, so it must complete (500 ms of slack
+      // for timer overshoot under load). A watchdog that measures from its
+      // last re-arm and skips re-arming within a quarter window (the earlier
+      // implementation) ignores the 900 ms progress and fires at 4000 ms,
+      // 400 ms before the second progress.
+      const watchdog = (service as any).runWithInactivityTimeout.bind(service);
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      const result = await watchdog(async (onProgress: () => void) => {
+        await sleep(900);
+        onProgress();
+        await sleep(3_500);
+        onProgress();
+        return "done";
+      }, 4_000, "precision probe");
+
+      assert.equal(result, "done");
+      await assert.rejects(
+        () => watchdog(() => new Promise(() => {}), 300, "silent probe"),
+        /silent probe stalled: no progress for 300ms/,
+      );
+    });
+
     test("a slow but steadily acknowledging peer is never killed by a short inactivity window", async () => {
-      const data = randomBytes(1536 * 1024);
+      // Acks every 100 ms against a 3 s window: 30x headroom, so only a
+      // watchdog that ignores progress can kill it -- not a busy event loop.
+      // 4 x 32 KiB per 100 ms makes 5 MiB take ~4 s, longer than the window.
+      const data = randomBytes(5 * 1024 * 1024);
       const localPath = writeLocal("slow-steady.bin", data);
       const startedAt = Date.now();
 
       const message = await service.upload(localPath, "/slow-steady.bin", "slowWrite", {
-        timeout: 1_000,
+        timeout: 3_000,
         sftpConcurrency: 4,
         skipIfIdentical: false,
       });
 
       assert.match(message, /File uploaded successfully/);
-      assert.ok(Date.now() - startedAt > 1_000, "the transfer must outlast the inactivity window for this test to mean anything");
+      assert.ok(Date.now() - startedAt > 3_000, "the transfer must outlast the inactivity window for this test to mean anything");
       assert.equal(md5(fs.readFileSync(servers.slowWrite.toLocalPath("/slow-steady.bin"))), md5(data));
     });
   });
@@ -786,6 +845,149 @@ describe("P1-06c transfer correctness against a real ssh2 server", { concurrency
         [{ remotePath: "/dbg-dl/a.txt", localPath: blocked }], "tree", { vvv: true });
       assert.equal(results[0].status, "failed");
       assert.match(results[0].reason, /\[SSH DEBUG\]/);
+    });
+  });
+  describe("section 6 R1: files in flight are decoupled from SFTP channels", () => {
+    const FILES = 48;
+    const rel = (index: number): string => `d${index % 6}/f${String(index).padStart(2, "0")}.txt`;
+    const content = (index: number): string => `r1 file ${index}\n`.repeat(10 + index);
+
+    test("uploadDirectory at fileConcurrency=16 uses at most 4 SFTP channels but more than 4 OPENs in flight", async () => {
+      const localDir = path.join(localRoot, "r1-up");
+      for (let index = 0; index < FILES; index += 1) writeLocal(path.join("r1-up", rel(index)), content(index));
+      servers.sessions.resetSftpChannelOpenCount();
+      servers.sessions.resetIoPeaks();
+
+      const uploaded = await service.uploadDirectory(localDir, "/r1-up-out", "sessions", { fileConcurrency: 16 });
+
+      assert.equal(uploaded.length, FILES);
+      for (let index = 0; index < FILES; index += 1) {
+        assert.equal(fs.readFileSync(servers.sessions.toLocalPath(`/r1-up-out/${rel(index)}`), "utf8"), content(index));
+      }
+      assert.ok(servers.sessions.stats.sftpChannelOpenCount <= 4, `opened ${servers.sessions.stats.sftpChannelOpenCount} SFTP channels`);
+      assert.ok(servers.sessions.stats.maxActiveOpens > 4, `OPEN peak was ${servers.sessions.stats.maxActiveOpens}`);
+    });
+
+    test("downloadDirectory at fileConcurrency=16 uses at most 4 SFTP channels but more than 4 OPENs in flight", async () => {
+      for (let index = 0; index < FILES; index += 1) write(servers.sessions, `/r1-down/${rel(index)}`, content(index));
+      const localDir = path.join(localRoot, "r1-down");
+      servers.sessions.resetSftpChannelOpenCount();
+      servers.sessions.resetIoPeaks();
+
+      const downloaded = await service.downloadDirectory("/r1-down", localDir, "sessions", { fileConcurrency: 16 });
+
+      assert.equal(downloaded.length, FILES);
+      for (let index = 0; index < FILES; index += 1) {
+        assert.equal(fs.readFileSync(path.join(localDir, ...rel(index).split("/")), "utf8"), content(index));
+      }
+      assert.ok(servers.sessions.stats.sftpChannelOpenCount <= 4, `opened ${servers.sessions.stats.sftpChannelOpenCount} SFTP channels`);
+      assert.ok(servers.sessions.stats.maxActiveOpens > 4, `OPEN peak was ${servers.sessions.stats.maxActiveOpens}`);
+    });
+
+    test("fileConcurrency above 64 is rejected before any remote work", async () => {
+      await assert.rejects(
+        () => service.uploadDirectory(localRoot, "/r1-too-many", "sessions", { fileConcurrency: 65 }),
+        (error: unknown) => error instanceof ToolError && error.code === "INVALID_CONFIGURATION" && /64/.test(error.message),
+      );
+      assert.equal(fs.existsSync(servers.sessions.toLocalPath("/r1-too-many")), false);
+    });
+
+    test("one file's SFTP status error neither discards the shared session nor affects the other files", async () => {
+      const items = Array.from({ length: 24 }, (_, index) => writeLocal(path.join("r1-batch", `b${String(index).padStart(2, "0")}.txt`), `batch ${index}`));
+      // A directory squatting on one target makes exactly that upload fail with a plain SFTP status error.
+      fs.mkdirSync(servers.sessions.toLocalPath("/r1-batch-out/b07.txt"), { recursive: true });
+      servers.sessions.resetSftpChannelOpenCount();
+
+      const result = await service.uploadBatch(items, "/r1-batch-out", "sessions", { onError: "continue", fileConcurrency: 8 });
+
+      assert.equal(result.failedCount, 1);
+      assert.equal(result.uploadedCount, 23);
+      assert.ok(servers.sessions.stats.sftpChannelOpenCount <= 4, `opened ${servers.sessions.stats.sftpChannelOpenCount} SFTP channels (a status error must not force a reopen)`);
+    });
+
+    test("a connection-level failure still discards the session and the batch recovers", async () => {
+      const items = Array.from({ length: 12 }, (_, index) => writeLocal(path.join("r1-drop", `c${String(index).padStart(2, "0")}.txt`), `drop ${index}`));
+      await service.uploadBatch(items.slice(0, 1), "/r1-drop-out", "sessions", {});
+      servers.sessions.resetConnectionCount();
+      servers.sessions.dropAllConnections();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const first = await service.uploadBatch(items, "/r1-drop-out", "sessions", { onError: "continue", fileConcurrency: 4 });
+      const second = await service.uploadBatch(items, "/r1-drop-out", "sessions", { onError: "continue", fileConcurrency: 4, skipIfIdentical: false });
+
+      assert.equal(second.failedCount, 0, JSON.stringify(second.results.filter((r) => r.status === "failed")));
+      assert.ok(first.uploadedCount + first.skippedCount > 0);
+      assert.ok(servers.sessions.stats.connectionCount >= 1, "a new connection was opened");
+      for (let index = 0; index < items.length; index += 1) {
+        assert.equal(fs.readFileSync(servers.sessions.toLocalPath(`/r1-drop-out/c${String(index).padStart(2, "0")}.txt`), "utf8"), `drop ${index}`);
+      }
+    });
+  });
+
+  describe("section 6 R2: collect enumeration uses the READDIR attributes", () => {
+    test("no STAT/LSTAT request is made, sizes are right, directories are not collected", async () => {
+      for (let index = 0; index < 6; index += 1) write(servers.collect, `/r2/out/f${index}.json`, "x".repeat(10 + index));
+      fs.mkdirSync(servers.collect.toLocalPath("/r2/out/dir.json"), { recursive: true });
+      servers.collect.resetRequestCounts();
+
+      const matches = await findRemoteCollectFiles("collect", "/r2", ["out/*.json"]);
+
+      assert.deepEqual(matches.map((match) => [match.relativePath, match.bytes]), Array.from({ length: 6 }, (_, index) => [`out/f${index}.json`, 10 + index]));
+      assert.equal(servers.collect.stats.requestCounts.STAT ?? 0, 0);
+      assert.equal(servers.collect.stats.requestCounts.LSTAT ?? 0, 0);
+    });
+
+    test("a matching entry that is not a regular file (a FIFO) is not collected", async () => {
+      write(servers.collect, "/r2b/out/real.json", "{}");
+      write(servers.collect, "/r2b/out/pipe.json", "");
+      servers.collect.presentAsFifo("/r2b/out/pipe.json");
+
+      const matches = await findRemoteCollectFiles("collect", "/r2b", ["out/*.json"]);
+
+      assert.deepEqual(matches.map((match) => match.relativePath), ["out/real.json"]);
+    });
+  });
+
+  describe("section 6 R3: copy-data capability is cached per server", () => {
+    test("the second same-server relay opens no SFTP channel for the probe", async () => {
+      write(servers.relay, "/r3-src.bin", randomBytes(50_000));
+      servers.relay.resetSftpChannelOpenCount();
+      await service.transferBetweenServers("copyProbe", "/r3-src.bin", "copyProbe", "/r3-dst-1.bin", {});
+      const first = servers.relay.stats.sftpChannelOpenCount;
+      servers.relay.resetSftpChannelOpenCount();
+
+      const message = await service.transferBetweenServers("copyProbe", "/r3-src.bin", "copyProbe", "/r3-dst-2.bin", { vvv: true });
+
+      assert.match(message, /windowed via SFTP/);
+      assert.match(message, /not advertised/);
+      assert.equal(servers.relay.stats.sftpChannelOpenCount, first - 1, "the relay's own source+dest channels only");
+    });
+
+    test("concurrent first relays share one probe", async () => {
+      write(servers.relay, "/r3-src2.bin", randomBytes(20_000));
+      servers.relay.resetSftpChannelOpenCount();
+
+      await Promise.all([1, 2, 3].map((n) =>
+        service.transferBetweenServers("copyProbe2", "/r3-src2.bin", "copyProbe2", `/r3-dst2-${n}.bin`, {})));
+
+      // 3 relays x (source + dest) channels + exactly one probe channel.
+      assert.equal(servers.relay.stats.sftpChannelOpenCount, 3 * 2 + 1);
+    });
+
+    test("a probe that fails to run is not cached: the next same-server relay probes again and succeeds", async () => {
+      const data = randomBytes(30_000);
+      write(servers.relay, "/r3-src3.bin", data);
+      servers.relay.rejectNextSftpRequests = 1; // the probe's session open
+      try {
+        await assert.rejects(() => service.transferBetweenServers("copyProbe3", "/r3-src3.bin", "copyProbe3", "/r3-dst3.bin", {}));
+      } finally {
+        servers.relay.rejectNextSftpRequests = 0;
+      }
+
+      const message = await service.transferBetweenServers("copyProbe3", "/r3-src3.bin", "copyProbe3", "/r3-dst3.bin", {});
+
+      assert.match(message, /Transfer complete/);
+      assert.equal(md5(fs.readFileSync(servers.relay.toLocalPath("/r3-dst3.bin"))), md5(data));
     });
   });
 });

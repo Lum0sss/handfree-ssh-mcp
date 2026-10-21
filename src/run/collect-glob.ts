@@ -1,5 +1,5 @@
 import { isSafeRelativeEntrypoint, matchesAllowedEntrypoint } from "./entrypoint-glob.js";
-import { listRemoteDirectory, statRemoteFile, type RemoteDirEntry } from "./remote-sftp.js";
+import { listRemoteDirectory, type RemoteDirEntry } from "./remote-sftp.js";
 
 /**
  * PLAN.MD P2-06 / §5.8: "glob 解析相对 remoteRoot...拒绝逃逸" and "Reuse
@@ -58,7 +58,7 @@ const MAX_COLLECT_WALK_ENTRIES = 200_000;
  * Real remote walk (SFTP readdir, breadth-first) under `remoteRootAbsolute`,
  * returning every regular file (never a directory, never a symlink -- see
  * isCollectCandidateSafe) whose remoteRoot-relative path matches at least
- * one of `patterns`, each stat'd for its byte size. Sorted by relativePath
+ * one of `patterns`, with its byte size taken from the READDIR attributes. Sorted by relativePath
  * for a deterministic result independent of directory-listing order.
  *
  * `patterns` empty means "collect nothing" at the caller layer (§5.8: never
@@ -98,15 +98,13 @@ export async function findRemoteCollectFiles(
         queue.push(relativePath);
         continue;
       }
-      if (!matchesCollectGlob(relativePath, patterns)) {
+      // The READDIR attrs already carry the type and size: no per-file stat.
+      // A file that vanishes or changes between the listing and the download
+      // is reported by the download itself.
+      if (!entry.isFile || !matchesCollectGlob(relativePath, patterns)) {
         continue;
       }
-      const absolutePath = `${remoteRootAbsolute}/${relativePath}`;
-      const stat = await statRemoteFile(serverName, absolutePath, reuseConnection);
-      if (stat === null || !stat.isFile) {
-        continue; // vanished or changed type between readdir and stat
-      }
-      matches.push({ relativePath, absolutePath, bytes: stat.size });
+      matches.push({ relativePath, absolutePath: `${remoteRootAbsolute}/${relativePath}`, bytes: entry.size });
     }
   }
 

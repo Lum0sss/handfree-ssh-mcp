@@ -153,8 +153,9 @@ Parameters:
                   scheduling new files once one fails, drain in-flight ones.
                   "continue": attempt every file regardless of earlier failures.
                   Both report a per-file uploaded/skipped/failed status.
-  fileConcurrency (number, optional)   Batch mode only. Independent files
-                  uploaded in parallel. Default 4, maximum 8.
+  fileConcurrency (number, optional)   Batch mode only. Files in flight at
+                  once. Default 32, maximum 64. They share at most 4 SFTP
+                  channels.
   connections     (number, optional)   Single file only (not batch). Default 1
                   (default behavior). Above 1, write the file over that many
                   INDEPENDENT SSH/TCP connections, each carrying its own
@@ -284,8 +285,8 @@ Parameters for upload / download:
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
   fast            (boolean, optional)  Default true. upload/download only:
                   use ssh2 fastPut/fastGet for each file. Independent files
-                  are scheduled in parallel using fileConcurrency, each worker
-                  reusing one SFTP session. false is a serial compatibility
+                  are scheduled in parallel using fileConcurrency over a few
+                  shared SFTP sessions. false is a serial compatibility
                   mode and is much slower.
   sftpConcurrency (number, optional)   Upload/download with fast=true: concurrent
                   SFTP chunks. Relay: prefetched source chunks, default 64.
@@ -312,11 +313,11 @@ Parameters for upload / download:
                   Rejected for relay strategy="direct"/"auto", a batch
                   (array) localPath, recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
-                  files transferred in parallel. Default 4, maximum 8. Each
-                  parallel file opens its own SFTP channel on the same SSH
-                  connection; capped under OpenSSH's common default
-                  MaxSessions=10 so it does not reliably fail channel-open
-                  against a default-configured remote.
+                  files in flight at once. Default 32, maximum 64. The
+                  files share at most min(fileConcurrency, 4) SFTP channels
+                  on the same SSH connection (requests are multiplexed on a
+                  channel), so the count stays well under OpenSSH's common
+                  default MaxSessions=10 however many files are in flight.
   onError         (string, optional)   Batch upload only (array localPath).
                   "abort" (default): stop scheduling new files once one fails,
                   drain in-flight ones. "continue": attempt every file

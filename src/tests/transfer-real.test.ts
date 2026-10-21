@@ -427,15 +427,15 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
         localPath: input,
         remotePath: "/must-not-be-created",
         recursive: true,
-        fileConcurrency: 9,
+        fileConcurrency: 65,
       },
     });
     assert.equal(result.isError, true);
-    assert.match(responseText(result), /fileConcurrency.*(?:maximum|exceed).*8/i);
+    assert.match(responseText(result), /fileConcurrency.*(?:maximum|exceed).*64/i);
     assert.equal(fs.existsSync(destinationServer.toLocalPath("/must-not-be-created")), false);
   });
 
-  test("grey-box: recursive upload at the fileConcurrency cap never opens more real SFTP channels than the cap", async () => {
+  test("grey-box: recursive upload with more files in flight than the session cap never opens more than 4 real SFTP channels", async () => {
     const input = path.join(localRoot, "cap-concurrency-input");
     writeFixtureTree(input, 24);
     // maxActiveSftpChannels is a high-water mark accumulated across the whole
@@ -444,7 +444,7 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     // test so the assertions below can only be satisfied by concurrency this
     // transfer itself produced — comparing against accumulated state would be
     // order- and timing-dependent (an earlier test could have already pushed
-    // the peak to 8, or this run's genuine peak could be masked by a higher
+    // the peak above 4, or this run's genuine peak could be masked by a higher
     // one left over from before). See G2.
     destinationServer.resetChannelPeak();
     const result = await mcpClient.callTool({
@@ -463,14 +463,13 @@ describe("transfer real execution acceptance", { concurrency: false }, () => {
     assert.equal(result.isError, undefined, responseText(result));
     assertTreeEqual(destinationServer.toLocalPath("/cap-concurrency"), input);
     const peak = destinationServer.stats.maxActiveSftpChannels;
-    // This is the real invariant the fileConcurrency cap of 8 exists to protect:
-    // OpenSSH's default MaxSessions=10 bounds concurrently open channels on one
-    // connection, and every upload() call opens its own SFTP channel. The
-    // observed peak (a real server-side channel count, not client bookkeeping)
-    // must never exceed the cap.
-    assert.ok(peak <= 8, `observed peak concurrent SFTP channels: ${peak}, cap is 8`);
+    // fileConcurrency (8 files in flight) is decoupled from channels: a call
+    // opens at most 4 SFTP sessions, which leaves room under OpenSSH's default
+    // MaxSessions=10. The observed peak is a real server-side channel count,
+    // not client bookkeeping.
+    assert.ok(peak <= 4, `observed peak concurrent SFTP channels: ${peak}, cap is 4`);
     // And prove genuine concurrency actually happened during this transfer,
-    // so the <= 8 assertion above is evidence of a respected cap rather than
+    // so the <= 4 assertion above is evidence of a respected cap rather than
     // an accidentally serial run.
     assert.ok(peak > 1, `expected genuine concurrency, observed peak: ${peak}`);
   });

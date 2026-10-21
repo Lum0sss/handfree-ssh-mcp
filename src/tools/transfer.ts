@@ -77,7 +77,7 @@ export function registerTransferTool(server: McpServer): void {
         "Upload/download with fast=true: bytes per chunk. Relay: default 32768; total window at most 64 MiB.",
       ),
       fileConcurrency: z.number().int().positive().optional().describe(
-        "Recursive upload/download or batch upload: parallel files on one SSH connection. Default 4, maximum 8.",
+        "Recursive upload/download or batch upload: files in flight at once, default 32, maximum 64. They share at most 4 SFTP channels on one SSH connection.",
       ),
       connections: z.number().int().positive().optional().describe(
         "Single file only: 1-8 independent SSH/TCP connections, default 1. Relay opens N per server and requires strategy=relay. Excludes batch/recursive/archive/direct/auto. Above 1 ignores fast/sftpConcurrency/chunkSize; see help for limits.",

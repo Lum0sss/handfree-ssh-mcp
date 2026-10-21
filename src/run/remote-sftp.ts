@@ -195,6 +195,11 @@ export async function readRemoteByteRange(
 export interface RemoteDirEntry {
   filename: string;
   isDirectory: boolean;
+  /** Regular file (`S_IFMT == S_IFREG`) per the READDIR attrs; devices, FIFOs
+   * and sockets are neither this nor a directory. */
+  isFile: boolean;
+  /** Size in bytes from the READDIR attrs (lstat-based, like the mode). */
+  size: number;
   /** PLAN.MD P2-06: collect must never traverse or download through a
    * symlink (the simplest sufficient rule that makes "symlink pointing
    * outside remoteRoot" structurally unreachable -- see
@@ -210,6 +215,7 @@ export interface RemoteDirEntry {
 const S_IFMT = 0o170000;
 const S_IFLNK = 0o120000;
 const S_IFDIR = 0o040000;
+const S_IFREG = 0o100000;
 
 /** Lists a remote directory. Returns an empty array if it does not exist
  * (e.g. no runs have ever been launched for this server yet). */
@@ -228,6 +234,8 @@ export async function listRemoteDirectory(
       resolve(list.map((entry) => ({
         filename: entry.filename,
         isDirectory: (entry.attrs.mode & S_IFDIR) !== 0,
+        isFile: (entry.attrs.mode & S_IFMT) === S_IFREG,
+        size: entry.attrs.size,
         isSymlink: (entry.attrs.mode & S_IFMT) === S_IFLNK,
       })));
     });

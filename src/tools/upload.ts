@@ -29,7 +29,7 @@ export function registerUploadTool(server: McpServer): void {
       sftpConcurrency: z.number().int().positive().optional().describe("Concurrent SFTP chunks when fast=true; default ssh2 setting."),
       chunkSize: z.number().int().positive().optional().describe("Bytes per SFTP chunk when fast=true; default ssh2 setting."),
       onError: z.enum(["abort", "continue"]).optional().describe("Batch only: abort (default) stops scheduling after failure; continue attempts all files. In-flight files finish; results report each outcome."),
-      fileConcurrency: z.number().int().positive().optional().describe("Batch file concurrency: default 4, maximum 8. Separate SFTP channels on one SSH connection."),
+      fileConcurrency: z.number().int().positive().optional().describe("Batch upload: files in flight at once, default 32, maximum 64. They share at most 4 SFTP channels on one SSH connection."),
       connections: z.number().int().positive().optional().describe("Single file only: 1-8 independent SSH/TCP connections, default 1. Splits byte ranges into a remote temp file before replacement. Above 1 ignores fast/sftpConcurrency/chunkSize. Helps high-latency links; see help for limits."),
     },
     async ({ localPath, remotePath, connectionName, skipIfIdentical, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, onError, fileConcurrency, connections }) => {
