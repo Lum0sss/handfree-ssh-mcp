@@ -189,3 +189,12 @@ Handfree started as a fork of [classfang/ssh-mcp-server](https://github.com/clas
 ISC License · Original work © 2025 junki.cn · Modifications © 2026 woqucc
 
 <sub>🧪 Almost entirely AI-written, this README included.</sub>
+
+## Optional plugins
+
+Handfree supports independent CLI plugins through a personal declarative registry.
+Discover them with `plugin-list`, check/install/update with `plugin-activate`, read
+the installed version’s instructions with `plugin-skill`, and invoke its CLI with
+`plugin-run`. SSH components use existing connection aliases and command policies.
+See [plugin configuration and lifecycle](docs/plugins.md) and
+[example manifests](examples/plugins/registry.example.yaml).

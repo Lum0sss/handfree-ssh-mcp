@@ -1,3 +1,4 @@
+import { registerPluginTools } from "./plugins.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerExecuteCommandTool } from "./execute-command.js";
 import { registerUploadTool } from "./upload.js";
@@ -35,4 +36,5 @@ export function registerAllTools(server: McpServer): void {
   registerRunCancelTool(server);
   registerRunRetryTool(server);
   registerHelpTool(server);
+  registerPluginTools(server);
 }
