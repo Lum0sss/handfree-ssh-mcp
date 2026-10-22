@@ -13,6 +13,8 @@ import { registerRunStatusTool } from "../tools/run-status.js";
 import { registerRunLogsTool } from "../tools/run-logs.js";
 import { registerRunListTool } from "../tools/run-list.js";
 import { registerRunCancelTool } from "../tools/run-cancel.js";
+import { registerRunRetryTool } from "../tools/run-retry.js";
+import { RunService } from "../run/run-service.js";
 import { RealSshTestServer } from "./helpers/real-ssh-server.js";
 
 // PLAN.MD P2-05: black-box through a real stdio-shaped MCP transport
@@ -104,6 +106,7 @@ describe("P2-05 black-box: workspace-run / run-status / run-logs / run-list / ru
     registerRunLogsTool(mcpServer);
     registerRunListTool(mcpServer);
     registerRunCancelTool(mcpServer);
+    registerRunRetryTool(mcpServer);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await mcpServer.connect(serverTransport);
     await mcpClient.connect(clientTransport);
@@ -404,6 +407,49 @@ describe("P2-05 black-box: workspace-run / run-status / run-logs / run-list / ru
     // (as actually happened testing workspace-run for real on .88) had no
     // parameter to force a fresh one, unlike every SFTP-using tool in the
     // rest of this codebase.
+    test("launch and retry guidance can query the original server with multiple targets enabled", async () => {
+      const runId = "run_20260915T120000Z_a0000001";
+      const service = RunService.getInstance();
+      const originalLaunch = service.launch;
+      const originalRetry = service.retry;
+      const config = { ...manager.getConfig("remote") };
+      // Launching needs Linux process semantics; use the seeded completed
+      // task to exercise the returned follow-up through real MCP and SFTP.
+      const launched = {
+        runId, server: "remote", phases: [], status: { state: "completed" },
+      } as unknown as Awaited<ReturnType<RunService["launch"]>>;
+      service.launch = async () => launched;
+      service.retry = async () => launched;
+      manager.setConfig({ remote: config, other: { ...config, name: "other" } }, ["remote", "other"]);
+      try {
+        for (const name of ["workspace-run", "run-retry"]) {
+          const started = responseJson(await mcpClient.callTool({
+            name,
+            arguments: name === "workspace-run"
+              ? { server: "remote", remoteRoot: "/data/proj", executable: "python3", entrypoint: "train.py" }
+              : { runId, connectionName: "remote" },
+          }));
+          assert.equal(started.ok, true);
+          const suggestions = [...started.next.matchAll(/(run-status|run-logs|run-cancel) (\{[^}]+\})/g)];
+          assert.equal(suggestions.length, 3);
+          for (const [, , json] of suggestions) {
+            const args = JSON.parse(json);
+            assert.equal(args.connectionName, "remote");
+            assert.equal(args.runId, runId);
+          }
+          const queried = responseJson(await mcpClient.callTool({
+            name: suggestions[0][1], arguments: JSON.parse(suggestions[0][2]),
+          }));
+          assert.equal(queried.ok, true);
+          assert.equal(queried.state, "completed");
+        }
+      } finally {
+        service.launch = originalLaunch;
+        service.retry = originalRetry;
+        manager.setConfig({ remote: config }, ["remote"]);
+      }
+    });
+
     test("reuseConnection:false opens a genuinely new SFTP connection; default reuses the cached one", async () => {
       const runId = "run_20260915T120000Z_a0000001"; // seeded above, terminal (exit.json present)
 

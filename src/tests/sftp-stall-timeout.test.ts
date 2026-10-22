@@ -1,7 +1,7 @@
 /**
  * Whitebox tests for the SFTP transfer stall watchdog.
  *
- * Bug: the non-fast SFTP stream paths (sftpWriteBuffer, sftpReadBuffer, and the
+ * Bug: the non-fast SFTP stream paths (sftpWriteBuffer and the
  * download/relay pipes) only settled on close/finish/error. On a reused-but-dead
  * SSH connection the channel opens yet the data write/read never progresses and
  * never errors, so the transfer hung until the caller's outer timeout (~300s).
@@ -92,12 +92,6 @@ class HealthyReadStream extends EventEmitter {
   }
 }
 
-function fakeClient(sftp: unknown): any {
-  return {
-    sftp: (cb: (err: Error | undefined, sftp: unknown) => void) => cb(undefined, sftp),
-  };
-}
-
 function fakeSftp(overrides: Record<string, unknown>): any {
   return {
     end: () => {},
@@ -111,11 +105,10 @@ describe("sftpWriteBuffer stall watchdog", () => {
   it("rejects with a retriable stall error when the write never acks", async () => {
     const ws = new StallWriteStream();
     const sftp = fakeSftp({ createWriteStream: () => ws });
-    const client = fakeClient(sftp);
 
     const start = Date.now();
     await assert.rejects(
-      manager.transferService.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS),
+      manager.transferService.sftpWriteBuffer(sftp, "/remote/f", Buffer.alloc(4096), STALL_MS),
       (err: any) =>
         err?.code === "SSH_CONNECTION_FAILED" &&
         err?.retriable === true &&
@@ -127,46 +120,8 @@ describe("sftpWriteBuffer stall watchdog", () => {
   it("resolves when the write acks and closes", async () => {
     const ws = new HealthyWriteStream();
     const sftp = fakeSftp({ createWriteStream: () => ws });
-    const client = fakeClient(sftp);
 
-    await manager.transferService.sftpWriteBuffer(client, "/remote/f", Buffer.alloc(4096), STALL_MS);
-  });
-});
-
-describe("sftpReadBuffer stall watchdog", () => {
-  const manager = SSHConnectionManager.getInstance() as any;
-
-  it("rejects with a retriable stall error when no data arrives", async () => {
-    const rs = new StallReadStream();
-    const sftp = fakeSftp({ createReadStream: () => rs });
-    const client = fakeClient(sftp);
-
-    const start = Date.now();
-    await assert.rejects(
-      manager.transferService.sftpReadBuffer(client, "/remote/f", 1024, STALL_MS),
-      (err: any) =>
-        err?.code === "SSH_CONNECTION_FAILED" &&
-        err?.retriable === true &&
-        /stall/i.test(err.message),
-    );
-    assert.ok(Date.now() - start < 5000, "must abort quickly, not hang");
-  });
-
-  it("resolves with the concatenated bytes when data streams to end", async () => {
-    const payload = Buffer.from("hello world");
-    // Construct lazily so emission (setImmediate) fires after listeners attach.
-    const sftp = fakeSftp({
-      createReadStream: () => new HealthyReadStream([payload.subarray(0, 5), payload.subarray(5)]),
-    });
-    const client = fakeClient(sftp);
-
-    const result: Buffer = await manager.transferService.sftpReadBuffer(
-      client,
-      "/remote/f",
-      payload.length,
-      STALL_MS,
-    );
-    assert.ok(result.equals(payload));
+    await manager.transferService.sftpWriteBuffer(sftp, "/remote/f", Buffer.alloc(4096), STALL_MS);
   });
 });
 

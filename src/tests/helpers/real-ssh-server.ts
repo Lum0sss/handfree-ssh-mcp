@@ -74,6 +74,31 @@ export interface RealSshServerStats {
   // last resetConnectionCount() -- a per-server connection budget is a bound
   // on exactly this.
   maxLiveConnections: number;
+  // PLAN.MD P1-06c: READ requests currently in flight (request received, reply
+  // not yet sent) and the peak since resetIoPeaks(). The READ-side twin of
+  // activeWrites/maxActiveWrites; with readResponseDelayMs it proves whether a
+  // download keeps more than one READ outstanding (pipelined) or only one
+  // (ssh2 ReadStream).
+  activeReads: number;
+  maxActiveReads: number;
+  // PLAN.MD P1-06c: cumulative number of SFTP channels (subsystem requests)
+  // accepted since resetSftpChannelOpenCount(). Unlike maxActiveSftpChannels
+  // this never decrements, so it counts channels opened-and-closed one after
+  // another -- the "one session per file" pattern.
+  sftpChannelOpenCount: number;
+  // PLAN.MD P1-06c: every exec command line received since resetExecLog(), in
+  // arrival order.
+  execCommands: string[];
+  // PLAN.MD P1-06c section 6: SFTP requests received per type ("STAT",
+  // "LSTAT", "OPEN", "READDIR", ...) since resetRequestCounts(). Lets a test
+  // prove which requests a code path does NOT make (e.g. zero STAT).
+  requestCounts: Record<string, number>;
+  // OPEN requests in flight (received, reply not yet sent) and their peak
+  // since resetIoPeaks(). With setOpenResponseDelayMs() this shows how many
+  // files are opened at the same time, independent of how many SFTP channels
+  // carry them.
+  activeOpens: number;
+  maxActiveOpens: number;
 }
 
 const { Server } = ssh2;
@@ -151,6 +176,13 @@ export class RealSshTestServer {
     activeHandshakes: 0,
     maxActiveHandshakes: 0,
     maxLiveConnections: 0,
+    activeReads: 0,
+    maxActiveReads: 0,
+    sftpChannelOpenCount: 0,
+    execCommands: [],
+    requestCounts: {},
+    activeOpens: 0,
+    maxActiveOpens: 0,
   };
 
   public port = 0;
@@ -201,6 +233,18 @@ export class RealSshTestServer {
   // Connection indices whose SFTP subsystem requests are genuinely refused:
   // a connection that is still up but can no longer carry an SFTP channel.
   private rejectSftpForConnectionIndex: Set<number> | null = null;
+  // PLAN.MD P1-06c: false makes `md5sum`, `md5 -r` and `rclone md5sum` (with
+  // or without a path argument) exit 127 "command not found", like a host
+  // with no usable MD5 tool.
+  private hashCommandsAvailable = true;
+  // PLAN.MD P1-06c: while true, WRITE requests are received but never answered
+  // -- a connection that is up but whose peer has stopped acknowledging, the
+  // real-server stand-in for the dead-but-reused-connection stall the
+  // inactivity watchdog exists for.
+  private stallWrites = false;
+  // Real delay before each OPEN is answered, so concurrent OPENs overlap in
+  // wall-clock time and maxActiveOpens is observable. 0 = unchanged.
+  private openResponseDelayMs = 0;
   // PLAN.MD P1-08a: parsed once in the constructor from
   // directExecOptions.authorizedPublicKeyPem (see below), or undefined when
   // that option is omitted -- `any` because ssh2's ParsedKey type isn't
@@ -349,12 +393,18 @@ export class RealSshTestServer {
               rejectSftp();
               return;
             }
+            if (this.rejectNextSftpRequests > 0) {
+              this.rejectNextSftpRequests -= 1;
+              rejectSftp();
+              return;
+            }
             // Each `session` here is one SSH channel; OpenSSH's `MaxSessions`
             // bounds exactly this — concurrently open channels on one
             // connection, not concurrent files or bytes. Count real channel
             // open/close so fileConcurrency-cap tests can observe the true
             // peak instead of trusting the client's own bookkeeping.
             this.stats.activeSftpChannels++;
+            this.stats.sftpChannelOpenCount++;
             this.stats.maxActiveSftpChannels = Math.max(
               this.stats.maxActiveSftpChannels,
               this.stats.activeSftpChannels,
@@ -425,6 +475,39 @@ export class RealSshTestServer {
     this.stats.readRequests.length = 0;
   }
 
+  public setOpenResponseDelayMs(delayMs: number): void {
+    this.openResponseDelayMs = delayMs;
+  }
+
+  public resetRequestCounts(): void {
+    for (const key of Object.keys(this.stats.requestCounts)) delete this.stats.requestCounts[key];
+  }
+
+  /** Reset the READ/WRITE/OPEN in-flight peaks to the current in-flight counts. */
+  public resetIoPeaks(): void {
+    this.stats.maxActiveOpens = this.stats.activeOpens;
+    this.stats.maxActiveReads = this.stats.activeReads;
+    this.stats.maxActiveWrites = this.stats.activeWrites;
+  }
+
+  public resetSftpChannelOpenCount(): void {
+    this.stats.sftpChannelOpenCount = 0;
+  }
+
+  public resetExecLog(): void {
+    this.stats.execCommands.length = 0;
+  }
+
+  /** See stallWrites above. */
+  public setStallWrites(stalled: boolean): void {
+    this.stallWrites = stalled;
+  }
+
+  /** See hashCommandsAvailable above. */
+  public setHashCommandsAvailable(available: boolean): void {
+    this.hashCommandsAvailable = available;
+  }
+
   /** Same reasoning as resetReadLog(), for the WRITE log. */
   public resetWriteLog(): void {
     this.stats.writeRequests.length = 0;
@@ -469,6 +552,18 @@ export class RealSshTestServer {
   public setRejectSftpForConnectionIndices(indices: number[] | null): void {
     this.rejectSftpForConnectionIndex = indices ? new Set(indices) : null;
   }
+
+  /** Refuse the next `count` SFTP subsystem requests on any connection (a
+   * server at its session limit), then accept again. */
+  public rejectNextSftpRequests = 0;
+
+  /** READDIR reports this (existing) path as a FIFO: a file type the test
+   * host's filesystem may not be able to create (NTFS cannot). */
+  public presentAsFifo(remotePath: string): void {
+    this.fifoPaths.add(this.toLocalPath(remotePath));
+  }
+
+  private readonly fifoPaths = new Set<string>();
 
   /** Server-side close of every open connection, as a remote restart would. */
   public dropAllConnections(): void {
@@ -533,6 +628,7 @@ export class RealSshTestServer {
 
   private attachSftp(sftp: any, connectionIndex = -1): void {
     const trace = (operation: string, detail = ""): void => {
+      this.stats.requestCounts[operation] = (this.stats.requestCounts[operation] ?? 0) + 1;
       if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
         process.stderr.write(`[real-sftp ${this.port}] ${operation}${detail ? ` ${detail}` : ""}\n`);
       }
@@ -580,10 +676,17 @@ export class RealSshTestServer {
       const localPath = this.toLocalPath(remotePath);
       const stringFlags = flagsToString(flags);
       if (!stringFlags) return sftp.status(requestId, STATUS_CODE.OP_UNSUPPORTED);
+      this.stats.activeOpens++;
+      this.stats.maxActiveOpens = Math.max(this.stats.maxActiveOpens, this.stats.activeOpens);
       fs.open(localPath, stringFlags, attrs.mode ?? 0o644, (error, fd) => {
-        if (error) return fail(requestId, error);
-        this.stats.openedFiles++;
-        sftp.handle(requestId, makeHandle({ kind: "file", fd, localPath }));
+        const reply = (): void => {
+          this.stats.activeOpens--;
+          if (error) return fail(requestId, error);
+          this.stats.openedFiles++;
+          sftp.handle(requestId, makeHandle({ kind: "file", fd, localPath }));
+        };
+        if (this.openResponseDelayMs > 0) setTimeout(reply, this.openResponseDelayMs);
+        else reply();
       });
     });
     sftp.on("READ", (requestId: number, handle: Buffer, offset: number, length: number) => {
@@ -598,7 +701,10 @@ export class RealSshTestServer {
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       const buffer = Buffer.alloc(length);
+      this.stats.activeReads++;
+      this.stats.maxActiveReads = Math.max(this.stats.maxActiveReads, this.stats.activeReads);
       const respond = (error: NodeJS.ErrnoException | null, bytesRead: number): void => {
+        this.stats.activeReads--;
         if (error) return fail(requestId, error);
         if (bytesRead === 0) return sftp.status(requestId, STATUS_CODE.EOF);
         sftp.data(requestId, buffer.subarray(0, bytesRead));
@@ -615,6 +721,7 @@ export class RealSshTestServer {
       if (this.failWritesForConnectionIndex?.has(connectionIndex)) {
         return sftp.status(requestId, STATUS_CODE.FAILURE, "injected per-connection write failure (test)");
       }
+      if (this.stallWrites) return;
       const state = lookupHandle(handle);
       if (!state || state.kind !== "file") return sftp.status(requestId, STATUS_CODE.FAILURE);
       this.stats.activeWrites++;
@@ -696,8 +803,10 @@ export class RealSshTestServer {
           }
           try {
             const names = entries.map((entry) => {
-              const stat = fs.lstatSync(path.join(localPath, entry.name));
-              return { filename: entry.name, longname: entry.name, attrs: attrsFromStat(stat) };
+              const entryPath = path.join(localPath, entry.name);
+              const attrs = attrsFromStat(fs.lstatSync(entryPath));
+              if (this.fifoPaths.has(entryPath)) attrs.mode = 0o010644; // S_IFIFO
+              return { filename: entry.name, longname: entry.name, attrs };
             });
             sftp.handle(requestId, makeHandle({ kind: "directory", entries: names, sent: false }));
           } catch (statError) {
@@ -737,6 +846,7 @@ export class RealSshTestServer {
 
   private executeCommand(channel: any, command: string): void {
     this.stats.execCommandCount++;
+    this.stats.execCommands.push(command);
     if (process.env.HANDFREE_REAL_SSH_TRACE === "1") {
       channel.on("close", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL CLOSE\n`));
       channel.on("end", () => process.stderr.write(`[real-ssh ${this.port}] CHANNEL END\n`));
@@ -752,6 +862,15 @@ export class RealSshTestServer {
     } catch (error) {
       channel.stderr.write(`${(error as Error).message}\n`);
       finish(2);
+      return;
+    }
+
+    const isHashCommand = words[0] === "md5sum" || (words[0] === "md5" && words[1] === "-r")
+      || (words[0] === "rclone" && words[1] === "md5sum");
+    if (!this.hashCommandsAvailable && isHashCommand) {
+      channel.stderr.write(`${words[0]}: command not found
+`);
+      finish(127);
       return;
     }
 

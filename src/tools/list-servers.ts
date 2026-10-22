@@ -10,10 +10,10 @@ import { formatToolErrorResponse, toToolError } from "../utils/tool-error.js";
 export function registerListServersTool(server: McpServer): void {
   server.tool(
     "list-servers",
-    "List the SSH servers that were loaded from OpenSSH config and/or YAML and enabled for this MCP process. Use this first to discover valid connectionName values, confirm whether a server is enabled, see jumpHost wiring, and check basic connection state before calling other tools. By default the response is lean (identity + connection state only). Set verbose=true to include the cached system status block (hostname, CPU, memory, disk, GPUs). Set refresh=true to re-collect that status from live servers; refresh implies verbose.",
+    "List configured servers with enabled/connected state and jump hosts. Use the returned names as connectionName (server in workspace-run). verbose includes cached system status; refresh probes enabled servers for live status.",
     {
-      verbose: z.boolean().optional().describe("Include the cached system status block (hostname, CPU, memory, disk, GPUs, etc.) for each server. Off by default to keep the response small. Implied by refresh=true."),
-      refresh: z.boolean().optional().describe("Re-collect live system status from all enabled servers before returning. Implies verbose=true. Without this, status (if requested via verbose) is read from the cache populated at connect time."),
+      verbose: z.boolean().optional().describe("Default false. Include cached system status; refresh=true implies verbose."),
+      refresh: z.boolean().optional().describe("Default false. Probe enabled servers for live system status; implies verbose."),
     },
     async ({ verbose, refresh }) => {
       try {

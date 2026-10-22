@@ -12,8 +12,11 @@
 
 ## tar-before-transfer 与碎文件并发
 
-- `upload`、`download` 以及 `transfer` 的上传/下载模式现在默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`；需要兼容路径时可显式设置 `fast: false`。
-- 不使用 tar 的递归传输通过 `fileConcurrency` 并行处理独立文件，默认 4、最大 8。上限收紧是因为每个并发文件都会在同一 SSH 连接上打开各自的 SFTP channel，必须低于远端的 `MaxSessions`（OpenSSH 常见默认值为 10），否则会稳定触发 channel 打开失败。实现会先建立完整目录树，再并发传文件，主要用于降低大量碎文件的逐文件往返开销。
+- `upload`、`download` 以及 `transfer` 的上传/下载模式默认启用 `fast`，即使用 ssh2 `fastPut` / `fastGet`，对所有调用方一致（包括 `workspace-run` 的 push 与 collect）。`fast: false` 是串行兼容模式：同一时刻只有一个请求在途，在有延迟的链路上会慢很多，除非服务器无法处理流水线请求，否则不要设置。
+- **上传的 skip-if-identical（默认开启）**：先 stat 远端文件（不存在或大小不同就上传）；大小相同时并行计算两端 MD5——远端由**服务器上的命令**计算（文件内容不经网络），本地用 Node `crypto`。远端命令按 rclone 的做法每台服务器探测一次：依次尝试 `md5sum`、`md5 -r`、`rclone md5sum`，输出等于空输入 MD5（`d41d8cd98f00b204e9800998ecf8427e`）的第一个被采用，结果（含「没有可用命令」）按服务器缓存。**远端没有可用的哈希命令时直接上传**，绝不为了比较而把远端文件读回本机。`skipIfIdentical: false` 强制上传。递归与批量上传逐文件使用同一判定。
+- **换行与 skip**：「相同」指远端字节等于将要写入的字节（即 CRLF 修正之后）。本地 `.sh` 含 CRLF、远端已是 LF：跳过；远端是 CRLF、本地是 LF：重新上传，远端随之变成 LF。非 shell 脚本不会被改写，CRLF 差异就是真实差异。
+- **同服务器 relay 走服务器自带的复制（`copy-data`）**：源与目标是同一台服务器、`strategy` 为 `relay`（默认）或 `auto`、且该服务器的 SFTP 声明了 `copy-data` 扩展（OpenSSH 9.0 及以上）时，由服务器自己复制，字节不再经本机往返。复制写入目标旁边的新临时文件，按 64 MiB 分块（每块都向 inactivity timeout 报告进度），校验大小与 MD5 后才替换目标；任何失败都会删除临时文件，目标保持原样。这条路径忽略 `connections`。服务器不支持 `copy-data` 时走原有 relay，`vvv: true` 时响应会说明原因。`strategy: "direct"` 不受影响。
+- 不使用 tar 的递归传输通过 `fileConcurrency` 并行处理独立文件，表示同时在途的文件数，默认 32、最大 64。这些文件共用至多 `min(fileConcurrency, 4)` 个 SFTP channel（worker `i` 使用 channel `i mod channel 数`）：一个 SFTP channel 本来就能同时承载多个请求，碎文件的速度取决于「在途文件数 / 每文件往返次数」，所以要加的是在途文件数而不是 channel 数。4 个 channel 也给远端的 `MaxSessions`（OpenSSH 常见默认值为 10）留出余量。只有连接级错误或 inactivity 卡死才会丢弃并重开 channel；单个文件的 SFTP 错误（不存在、无权限等）不会影响它。`reuseConnection: false` 时整次调用共用一条一次性连接。目录遍历也走同样的共享 channel。实现会先建立完整目录树，再并发传文件，主要用于降低大量碎文件的逐文件往返开销。
 - 设置 `archive: true` 后，源文件或目录会先自动打包为临时 tar，只传输一个归档文件，到目标目录后自动解包并清理本机及远端临时归档。源 basename 保持不变，无需再设置 `recursive: true`。
 - `archiveCompression` 可选 `none`（默认）、`gzip`、`bzip2`、`xz`、`zstd`。参与打包或解包的 MCP 宿主与远端服务器都必须具备对应的 `tar`/压缩支持。
 
@@ -25,7 +28,7 @@
 - 传数组时，`remotePath` 必须是目录，每个源文件落到 `remotePath/<basename>`。
 - **basename 冲突在任何远端写入之前硬失败**：例如 `["a/config.yaml", "b/config.yaml"]` 会撞同一目标，返回 `BATCH_TARGET_COLLISION` 并列出冲突项；数组内重复路径同样报错，不会被静默去重。
 - 数组长度上限 1000（超出返回 `BATCH_TOO_LARGE`），空数组返回 `INVALID_CONFIGURATION`。
-- 并发复用与递归传输相同的 `fileConcurrency`（默认 4，上限 8）。
+- 并发复用与递归传输相同的 `fileConcurrency`（默认 32，上限 64）。
 - `onError` 控制失败处理：默认 `"abort"`——一旦某个文件失败就停止调度新文件，等待已在传输中的文件完成；`"continue"` 则无视之前的失败继续尝试每个文件。两种模式都会返回每个文件的 `uploaded` / `skipped` / `failed` 状态及失败原因。
 - 每个文件仍然复用现有单文件上传逻辑：skip-if-identical、`.sh`/`.bash`/`.zsh` 的 CRLF 修正、`fast`、路径策略校验全部自动继承，不重新实现。
 - 数组入参返回结构化 JSON（`{ results, total, uploadedCount, skippedCount, failedCount, crlfFixedCount }`），而不是单文件时的纯文本结果。

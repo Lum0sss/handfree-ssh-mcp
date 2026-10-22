@@ -24,6 +24,7 @@ import {
   type TransferLaneReservation,
 } from "../connection/ssh-connection-pool.js";
 import { SSHConfig } from "../models/types.js";
+import { MAX_FILE_CONCURRENCY } from "../contracts/transfer-contract.js";
 import { Logger } from "../utils/logger.js";
 import { ToolError } from "../utils/tool-error.js";
 import { OutputCollector } from "../utils/output-collector.js";
@@ -115,6 +116,35 @@ type BatchTransferOutcome<R> =
   | { status: "done"; value: R }
   | { status: "failed"; error: unknown }
   | { status: "not-run" };
+
+/** The local side of one upload, prepared once (see prepareUploadSource). */
+interface UploadSource {
+  path: string;
+  /** Bytes the remote file will have (the CRLF-fixed payload's size for a fixed shell script). */
+  size: number;
+  /** In-memory bytes to write, or null when fastPut streams the file from disk. */
+  payload: Buffer | null;
+  fastUpload: boolean;
+  crlfFixed: boolean;
+  crlfNote: string;
+}
+
+/**
+ * Per-call SFTP session holder (see TransferService.openTransferScope): one
+ * lazily-opened session per worker, discarded when its task fails.
+ */
+interface TransferScope {
+  run<T>(worker: number, task: (client: Client, sftp: SFTPWrapper) => Promise<T>, taskDebug?: SshDebugSink): Promise<T>;
+  close(): Promise<void>;
+}
+
+/** Per-file outcome of TransferService.downloadFiles. */
+export interface DownloadFileResult {
+  remotePath: string;
+  localPath: string;
+  status: "downloaded" | "failed" | "not-attempted";
+  reason?: string;
+}
 
 export const MAX_BATCH_UPLOAD_SIZE = 1000;
 
@@ -330,16 +360,12 @@ export class TransferService {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let timer: NodeJS.Timeout | null = null;
-      // ssh2 fastPut/fastGet invokes `step` for every acknowledged chunk. At
-      // the default 32 KiB chunk size that can mean thousands of callbacks per
-      // second. Re-creating a JS timer for every callback eventually dominates
-      // the event loop and makes an otherwise healthy transfer slow down. A
-      // watchdog only needs a recent proof of life, so coalesce those resets.
-      const progressRearmIntervalMs = Math.min(
-        1_000,
-        Math.max(1, Math.floor(timeoutMs / 4)),
-      );
-      let lastArmedAt = 0;
+      // ssh2 fastPut/fastGet invokes `step` for every acknowledged chunk --
+      // thousands of times a second at 32 KiB chunks -- so progress only
+      // records a timestamp. One timer checks it when it fires and re-arms for
+      // the rest of the window, so the stall fires after exactly `timeoutMs`
+      // of real silence, never earlier.
+      let lastProgressAt = Date.now();
 
       const clear = () => {
         if (timer) {
@@ -348,33 +374,32 @@ export class TransferService {
         }
       };
 
-      const arm = () => {
-        clear();
-        lastArmedAt = Date.now();
-        timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          debug?.(`[mcp] ${description} stalled: no progress for ${timeoutMs}ms`);
-          try {
-            onTimeout?.();
-          } catch {
-            // Ignore cleanup failures after a stall.
-          }
-          reject(new ToolError(
-            "SSH_CONNECTION_FAILED",
-            `${description} stalled: no progress for ${timeoutMs}ms`,
-            true,
-          ));
-        }, timeoutMs);
+      const check = () => {
+        if (settled) return;
+        const idleMs = Date.now() - lastProgressAt;
+        if (idleMs < timeoutMs) {
+          timer = setTimeout(check, timeoutMs - idleMs);
+          return;
+        }
+        settled = true;
+        debug?.(`[mcp] ${description} stalled: no progress for ${timeoutMs}ms`);
+        try {
+          onTimeout?.();
+        } catch {
+          // Ignore cleanup failures after a stall.
+        }
+        reject(new ToolError(
+          "SSH_CONNECTION_FAILED",
+          `${description} stalled: no progress for ${timeoutMs}ms`,
+          true,
+        ));
       };
 
       const onProgress = () => {
-        if (!settled && Date.now() - lastArmedAt >= progressRearmIntervalMs) {
-          arm();
-        }
+        lastProgressAt = Date.now();
       };
 
-      arm();
+      timer = setTimeout(check, timeoutMs);
       start(onProgress).then(
         (value) => {
           if (settled) return;
@@ -412,14 +437,19 @@ export class TransferService {
   private static readonly DEFAULT_RELAY_SFTP_CONCURRENCY = 64;
   private static readonly DEFAULT_RELAY_SFTP_CHUNK_BYTES = 32 * 1024;
   private static readonly MAX_RELAY_PREFETCH_BYTES = 64 * 1024 * 1024;
-  private static readonly DEFAULT_RECURSIVE_FILE_CONCURRENCY = 4;
-  // Each concurrent worker opens its own SFTP channel (see upload/download),
-  // and every recursive transfer already holds one extra channel briefly for
-  // mkdir. OpenSSH's default `MaxSessions 10` bounds concurrently open
-  // channels on a single connection, so a cap above that reliably produces
-  // channel-open failures against a default-configured sshd. 8 leaves headroom
-  // under the common default instead of assuming operators raised it.
-  private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = 8;
+  // fileConcurrency is the number of FILES in flight, not the number of SFTP
+  // channels: many files share a few sessions (an SFTP session multiplexes
+  // requests by id, so one session carries many outstanding requests).
+  // Throughput of a small-file tree is in-flight files / round trips per
+  // file, so this is the lever. Default from the .88 lab sweep (PLAN.MD
+  // P1-06c section 6, 50 ms RTT, 500 x 4 KiB): upload 31.0 / 15.1 / 7.6 /
+  // 4.2 s at 4 / 8 / 16 / 32, download alike -- still near-linear at 32.
+  private static readonly DEFAULT_RECURSIVE_FILE_CONCURRENCY = 32;
+  private static readonly MAX_RECURSIVE_FILE_CONCURRENCY = MAX_FILE_CONCURRENCY;
+  // SFTP sessions (channels) one multi-file call opens, at most. 4 is the
+  // former default channel count; it leaves room under OpenSSH's default
+  // `MaxSessions 10` for other concurrent calls on the same connection.
+  private static readonly MAX_SFTP_SESSIONS_PER_CALL = 4;
   private static readonly ARCHIVE_ERROR_OUTPUT_BYTES = 16 * 1024;
 
   // Multi-connection single-file download and upload (see
@@ -427,7 +457,7 @@ export class TransferService {
   // extra channel on a shared connection -- the relevant remote limit is
   // sshd's MaxStartups (concurrent unauthenticated connection attempts), not
   // MaxSessions (channels per connection, which is what
-  // MAX_RECURSIVE_FILE_CONCURRENCY above is sized against). 8 is a
+  // MAX_SFTP_SESSIONS_PER_CALL above is sized against). 8 is a
   // conservative ceiling given MaxStartups' common default (10); operators
   // running many concurrent multi-connection downloads against the same host
   // may need to raise it.
@@ -880,10 +910,9 @@ export class TransferService {
   }
 
   /**
-   * Recursive directory transfer is dominated by per-file SFTP setup and
-   * round trips when a tree contains many small files. Keep a conservative
-   * default so the optimization remains safe for smaller SSH servers, but let
-   * callers tune it within a hard cap.
+   * Recursive directory transfer is dominated by per-file round trips when a
+   * tree contains many small files, so the number of files in flight is the
+   * tuning knob. Defaulted, and capped, in the constants above.
    */
   private resolveRecursiveFileConcurrency(options?: SftpOptions): number {
     const requested = this.optionalPositiveInteger(options?.fileConcurrency, "fileConcurrency");
@@ -896,6 +925,11 @@ export class TransferService {
       );
     }
     return concurrency;
+  }
+
+  /** SFTP sessions a multi-file call needs: no more than files in flight, no more than the per-call cap. */
+  private sftpSessionsFor(fileConcurrency: number): number {
+    return Math.min(fileConcurrency, TransferService.MAX_SFTP_SESSIONS_PER_CALL);
   }
 
   /**
@@ -931,18 +965,18 @@ export class TransferService {
   private async runBoundedTransfers<T>(
     items: readonly T[],
     concurrency: number,
-    worker: (item: T) => Promise<void>,
+    worker: (item: T, workerIndex: number) => Promise<void>,
   ): Promise<void> {
     let nextIndex = 0;
     let firstError: unknown;
 
-    const runWorker = async (): Promise<void> => {
+    const runWorker = async (workerIndex: number): Promise<void> => {
       while (firstError === undefined) {
         const index = nextIndex;
         nextIndex += 1;
         if (index >= items.length) return;
         try {
-          await worker(items[index]);
+          await worker(items[index], workerIndex);
         } catch (error) {
           firstError ??= error;
           return;
@@ -951,7 +985,7 @@ export class TransferService {
     };
 
     await Promise.all(
-      Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker()),
+      Array.from({ length: Math.min(concurrency, items.length) }, (_, workerIndex) => runWorker(workerIndex)),
     );
     if (firstError !== undefined) {
       throw firstError;
@@ -974,19 +1008,19 @@ export class TransferService {
     items: readonly T[],
     concurrency: number,
     onError: BatchUploadOnError,
-    worker: (item: T) => Promise<R>,
+    worker: (item: T, workerIndex: number) => Promise<R>,
   ): Promise<Array<BatchTransferOutcome<R>>> {
     const outcomes: Array<BatchTransferOutcome<R>> = items.map(() => ({ status: "not-run" }));
     let nextIndex = 0;
     let aborted = false;
 
-    const runWorker = async (): Promise<void> => {
+    const runWorker = async (workerIndex: number): Promise<void> => {
       while (!(onError === "abort" && aborted)) {
         const index = nextIndex;
         nextIndex += 1;
         if (index >= items.length) return;
         try {
-          outcomes[index] = { status: "done", value: await worker(items[index]) };
+          outcomes[index] = { status: "done", value: await worker(items[index], workerIndex) };
         } catch (error) {
           outcomes[index] = { status: "failed", error };
           if (onError === "abort") aborted = true;
@@ -995,7 +1029,7 @@ export class TransferService {
     };
 
     await Promise.all(
-      Array.from({ length: Math.min(concurrency, items.length) }, () => runWorker()),
+      Array.from({ length: Math.min(concurrency, items.length) }, (_, workerIndex) => runWorker(workerIndex)),
     );
     return outcomes;
   }
@@ -1152,6 +1186,88 @@ export class TransferService {
   }
 
   /**
+   * One transfer scope per call (PLAN.MD P1-06c W3): every worker owns at most
+   * one lazily-opened SFTP session that is reused for all the files it
+   * handles, instead of two or three sessions per file.
+   *
+   * - The SSH client is re-acquired by server name for EVERY task. With a
+   *   cached connection that costs nothing; if the cached connection dropped
+   *   in the meantime the pool hands back a fresh client, the worker notices
+   *   the client changed and opens a new session on it. That keeps a batch
+   *   with onError=continue self-healing after a disconnect.
+   * - A connection-shaped failure (including the inactivity-watchdog stall)
+   *   discards the session and drops the cached client; the next task opens
+   *   a new session. A plain per-file SFTP status error keeps the session.
+   * - reuseConnection=false opens ONE one-shot connection for the whole call
+   *   (shared by all workers; the call's few SFTP sessions ride on it) and closes it
+   *   in close(); it used to be one connection per file.
+   */
+  private openTransferScope(
+    name: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+    sessions = 1,
+  ): TransferScope {
+    const reuseConnection = options?.reuseConnection !== false;
+    const timeout = options?.timeout;
+    // A session is shared by every worker mapped to it (worker % sessions),
+    // so it is created once: concurrent first users await the same open.
+    type Slot = { client: Client; ready: Promise<SFTPWrapper> };
+    const slots = new Map<number, Slot>();
+    let oneShot: Promise<AcquiredSshClient> | null = null;
+
+    const acquireClient = async (): Promise<Client> => {
+      if (reuseConnection) {
+        return (await this.pool.acquireSshClient(name, { reuseConnection: true, timeout, debug, purpose: "sftp" })).client;
+      }
+      oneShot ??= this.pool.acquireSshClient(name, { reuseConnection: false, timeout, debug, purpose: "sftp" });
+      return (await oneShot).client;
+    };
+    // Only the slot the caller used: another worker may already have replaced it.
+    const discard = (index: number, slot: Slot): void => {
+      if (slots.get(index) === slot) slots.delete(index);
+      slot.ready.then((sftp) => { try { sftp.end(); } catch { /* already gone */ } }, () => {});
+    };
+
+    return {
+      run: async <T>(worker: number, task: (client: Client, sftp: SFTPWrapper) => Promise<T>, taskDebug?: SshDebugSink): Promise<T> => {
+        const index = worker % sessions;
+        let slot: Slot | undefined;
+        try {
+          const client = await acquireClient();
+          slot = slots.get(index);
+          if (slot && slot.client !== client) {
+            discard(index, slot);
+            slot = undefined;
+          }
+          if (!slot) {
+            slot = { client, ready: this.openSftp(client, `session-${index}`, timeout, taskDebug ?? debug) };
+            slots.set(index, slot);
+          }
+          return await task(slot.client, await slot.ready);
+        } catch (error) {
+          // A connection-shaped failure (or the inactivity-watchdog stall,
+          // which is one) means the session is unusable for everyone sharing
+          // it. A per-file SFTP status error (no such file, permission
+          // denied, EISDIR) says nothing about the session, and discarding it
+          // would kill the other files' in-flight requests.
+          if (this.pool.isConnectionError(error as Error)) {
+            if (slot) discard(index, slot);
+            if (reuseConnection) this.pool.closeClient(name, true);
+          }
+          throw error;
+        }
+      },
+      close: async (): Promise<void> => {
+        for (const [index, slot] of [...slots]) discard(index, slot);
+        if (oneShot) {
+          (await oneShot.catch(() => null))?.close();
+        }
+      },
+    };
+  }
+
+  /**
    * Upload file
    */
   public async upload(
@@ -1161,86 +1277,22 @@ export class TransferService {
     options?: SftpOptions & { skipIfIdentical?: boolean },
   ): Promise<string> {
     const resolvedName = name || this.pool.defaultName;
-    const reuseConnection = options?.reuseConnection !== false;
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
-    const skipIfIdentical = options?.skipIfIdentical !== false; // default true
     // Validated BEFORE anything else opens a connection, so a request for an
     // invalid connection count never opens even one extra handshake.
     const connections = this.resolveTransferConnections(options);
-
-    // ---- Read local file (stat + content as Buffer) ----
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(validatedLocalPath);
-    } catch (e) {
-      throw new ToolError(
-        "LOCAL_FILE_READ_FAILED",
-        `Failed to stat local file '${validatedLocalPath}': ${(e as Error).message}`,
-        false,
-      );
-    }
-    if (!stat.isFile()) {
-      throw new ToolError(
-        "LOCAL_FILE_READ_FAILED",
-        `Local path '${validatedLocalPath}' is not a regular file (size=${stat.size}). ` +
-          `Use uploadDirectory / recursive=true for directories.`,
-        false,
-      );
-    }
-
-    const isShellScript = TransferService.SHELL_SCRIPT_EXTENSIONS.has(
-      path.extname(validatedLocalPath).toLowerCase(),
-    );
-    const fastUpload = options?.fast === true;
-    // fastPut reads from disk on its own. Keep that path zero-copy from this
-    // process's perspective: a default skip-if-identical check must not turn a
-    // large fast upload into a synchronous fs.readFileSync() followed by a
-    // second disk read inside ssh2.
-    const mustReadPayload = !fastUpload || isShellScript;
-    let payload: Buffer | null = null;
-    let crlfFixed: { buffer: Buffer; fixed: boolean; replacedCount: number } = {
-      buffer: Buffer.alloc(0),
-      fixed: false,
-      replacedCount: 0,
-    };
-
-    if (mustReadPayload) {
-      try {
-        payload = fs.readFileSync(validatedLocalPath);
-      } catch (e) {
-        throw new ToolError(
-          "LOCAL_FILE_READ_FAILED",
-          `Failed to read local file '${validatedLocalPath}': ${(e as Error).message}`,
-          false,
-        );
-      }
-
-      // ---- CRLF auto-fix for shell scripts ----
-      crlfFixed = TransferService.maybeFixShellScriptLineEndings(
-        validatedLocalPath,
-        payload,
-      );
-      payload = crlfFixed.buffer;
-    }
-
-    const crlfNote = crlfFixed.fixed
-      ? ` (${TransferService.CRLF_FIX_MARKER}: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
-      : "";
+    const source = this.prepareUploadSource(validatedLocalPath, options);
 
     if (connections > 1) {
       debug?.(`[mcp] sftp multi-connection upload on [${resolvedName}], connections=${connections}`);
       try {
         const message = await this.uploadMultiConnection(
           resolvedName,
-          validatedLocalPath,
           validatedRemotePath,
-          payload,
-          payload?.length ?? stat.size,
-          isShellScript,
-          skipIfIdentical,
-          crlfNote,
+          source,
+          options?.skipIfIdentical !== false,
           connections,
           options?.timeout,
           debug,
@@ -1252,96 +1304,212 @@ export class TransferService {
       }
     }
 
-    debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${reuseConnection}`);
-    let connection: AcquiredSshClient | null = null;
+    debug?.(`[mcp] sftp upload on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
+    const scope = this.openTransferScope(resolvedName, options, debug);
     try {
-      connection = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection,
-        timeout: options?.timeout,
-        debug,
-        purpose: "sftp",
-      });
-      const client = connection.client;
-
-      // ---- Skip-if-identical check ----
-      if (skipIfIdentical) {
-        const decision = await this.decideUploadSkip(
-          client,
-          payload,
-          validatedLocalPath,
-          stat.size,
-          validatedRemotePath,
-          isShellScript,
-          options?.timeout,
-          debug,
-        );
-        if (decision.skip) {
-          return appendDebugOutput(
-            TransferService.uploadSkippedMessage(validatedRemotePath, validatedLocalPath, decision.reason, crlfNote),
-            debugCollector,
-          );
-        }
-      }
-
-      // ---- Actually upload ----
-      if (fastUpload && !crlfFixed.fixed) {
-        await this.sftpFastPut(
-          client,
-          validatedLocalPath,
-          validatedRemotePath,
-          options,
-          options?.timeout,
-          debug,
-        );
-      } else {
-        await this.sftpWriteBuffer(client, validatedRemotePath, payload!, options?.timeout, debug);
-      }
-
-      const uploadedBytes = payload?.length ?? stat.size;
-      const modeNote = fastUpload && !crlfFixed.fixed ? " via fast SFTP" : "";
-      return appendDebugOutput(
-        `File uploaded successfully (${uploadedBytes} bytes${modeNote})${crlfNote}`,
-        debugCollector,
-      );
+      const message = await scope.run(0, (client, sftp) =>
+        this.uploadFileOn(client, sftp, resolvedName, validatedRemotePath, source, options, debug));
+      return appendDebugOutput(message, debugCollector);
     } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(resolvedName, true);
-      }
       throw appendDebugToError(error as Error, debugCollector);
     } finally {
-      connection?.close();
+      await scope.close();
     }
   }
 
-  /** The single-file skip-if-identical decision, shared by the single- and
-   * multi-connection upload paths: an in-memory payload (buffered path, or a
-   * CRLF-fixed shell script) is compared as bytes; otherwise the local file
-   * is compared without being read into memory. */
-  private decideUploadSkip(
-    client: Client,
-    payload: Buffer | null,
+  /**
+   * One file of a recursive or batch upload: validate, prepare the local
+   * source, then run the per-file core on the worker's session. Preparing the
+   * source happens outside scope.run so a local read error never discards a
+   * healthy session.
+   */
+  private async uploadFileInScope(
+    scope: TransferScope,
+    worker: number,
+    resolvedName: string,
     localPath: string,
-    localSize: number,
     remotePath: string,
-    isShellScript: boolean,
-    timeout?: number,
-    debug?: SshDebugSink,
+    options: (SftpOptions & { skipIfIdentical?: boolean }) | undefined,
+  ): Promise<string> {
+    // One bounded debug sink per file, exactly as a standalone upload() has:
+    // it rides on that file's result or error.
+    const { collector, debug } = createDebugCollector(options?.vvv === true);
+    try {
+      const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
+      const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
+      const source = this.prepareUploadSource(validatedLocalPath, options);
+      const message = await scope.run(worker, (client, sftp) =>
+        this.uploadFileOn(client, sftp, resolvedName, validatedRemotePath, source, options, debug), debug);
+      return appendDebugOutput(message, collector);
+    } catch (error) {
+      throw appendDebugToError(error as Error, collector);
+    }
+  }
+
+  /**
+   * The local side of one upload: stat, and the in-memory payload when the
+   * upload needs one. `fast` (the default) streams the file from disk inside
+   * ssh2 fastPut and reads nothing here, except a shell script, which is read
+   * so CRLF can be converted to LF. `fast:false` always buffers the payload.
+   */
+  private prepareUploadSource(localPath: string, options: SftpOptions | undefined): UploadSource {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(localPath);
+    } catch (e) {
+      throw new ToolError(
+        "LOCAL_FILE_READ_FAILED",
+        `Failed to stat local file '${localPath}': ${(e as Error).message}`,
+        false,
+      );
+    }
+    if (!stat.isFile()) {
+      throw new ToolError(
+        "LOCAL_FILE_READ_FAILED",
+        `Local path '${localPath}' is not a regular file (size=${stat.size}). ` +
+          `Use uploadDirectory / recursive=true for directories.`,
+        false,
+      );
+    }
+
+    const isShellScript = TransferService.SHELL_SCRIPT_EXTENSIONS.has(path.extname(localPath).toLowerCase());
+    const fastUpload = options?.fast !== false;
+    let payload: Buffer | null = null;
+    let crlfFixed = { fixed: false, replacedCount: 0 };
+    if (!fastUpload || isShellScript) {
+      try {
+        payload = fs.readFileSync(localPath);
+      } catch (e) {
+        throw new ToolError(
+          "LOCAL_FILE_READ_FAILED",
+          `Failed to read local file '${localPath}': ${(e as Error).message}`,
+          false,
+        );
+      }
+      const fixed = TransferService.maybeFixShellScriptLineEndings(localPath, payload);
+      payload = fixed.buffer;
+      crlfFixed = fixed;
+    }
+
+    return {
+      path: localPath,
+      // The size the remote file will have: the CRLF-fixed payload's, not the
+      // on-disk file's.
+      size: payload?.length ?? stat.size,
+      payload,
+      fastUpload,
+      crlfFixed: crlfFixed.fixed,
+      crlfNote: crlfFixed.fixed
+        ? ` (${TransferService.CRLF_FIX_MARKER}: converted ${crlfFixed.replacedCount} line endings to LF before upload because target is a shell script).`
+        : "",
+    };
+  }
+
+  /**
+   * The per-file upload core: stat, skip decision and the transfer all run on
+   * the one SFTP session the caller already opened.
+   */
+  private async uploadFileOn(
+    client: Client,
+    sftp: SFTPWrapper,
+    serverName: string,
+    remotePath: string,
+    source: UploadSource,
+    options: (SftpOptions & { skipIfIdentical?: boolean }) | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string> {
+    if (options?.skipIfIdentical !== false) {
+      const decision = await this.decideUploadSkip(client, sftp, serverName, remotePath, source, options?.timeout, debug);
+      debug?.(`[mcp] upload skip check for ${remotePath}: ${decision.skip ? "skip" : "upload"} (${decision.reason})`);
+      if (decision.skip) {
+        return TransferService.uploadSkippedMessage(remotePath, source.path, decision.reason, source.crlfNote);
+      }
+    }
+
+    const viaFastPut = source.fastUpload && !source.crlfFixed;
+    if (viaFastPut) {
+      await this.sftpFastPut(sftp, source.path, remotePath, options, options?.timeout, debug);
+    } else {
+      await this.sftpWriteBuffer(sftp, remotePath, source.payload!, options?.timeout, debug);
+    }
+    return `File uploaded successfully (${source.size} bytes${viaFastPut ? " via fast SFTP" : ""})${source.crlfNote}`;
+  }
+
+  /**
+   * The single skip-if-identical decision, shared by the single- and
+   * multi-connection upload: skip iff the remote file already holds exactly
+   * the bytes this upload would write (the CRLF-fixed payload for a shell
+   * script, the file otherwise).
+   *
+   * stat over the caller's open session; a missing file or a different size
+   * means upload. Same size: MD5 both sides IN PARALLEL -- the remote hash is
+   * computed by a command on the server (no file content crosses the
+   * network), the local one by Node crypto (the in-memory payload, or the
+   * file streamed). No usable remote hash command means upload, never "read
+   * the remote file to compare" (rclone treats a missing hash the same way;
+   * rsync's principle is the same: never ship content just to compare it).
+   */
+  private async decideUploadSkip(
+    client: Client,
+    sftp: SFTPWrapper,
+    serverName: string,
+    remotePath: string,
+    local: UploadSource,
+    timeout: number | undefined,
+    debug: SshDebugSink | undefined,
   ): Promise<{ skip: boolean; reason: string }> {
-    return payload
-      ? this.shouldSkipUpload(client, payload, remotePath, isShellScript, timeout, debug)
-      : this.shouldSkipFastUpload(client, localPath, localSize, remotePath, timeout, debug);
+    let remoteSize: number;
+    try {
+      remoteSize = (await this.sftpStat(sftp, remotePath, "dest")).size;
+    } catch {
+      return { skip: false, reason: "remote-missing-or-unstat-able" };
+    }
+    if (remoteSize !== local.size) {
+      return { skip: false, reason: `size-differs(local=${local.size},remote=${remoteSize})` };
+    }
+
+    // Detected (and cached) first so a host with no hash command does not
+    // make us hash a large local file for nothing.
+    try {
+      if (!(await this.detectRemoteHashCommand(serverName, client, debug))) {
+        return { skip: false, reason: "remote-hash-unavailable" };
+      }
+    } catch (error) {
+      return { skip: false, reason: `remote-hash-failed(${(error as Error).message})` };
+    }
+    const [remoteHash, localHash] = await Promise.allSettled([
+      this.remoteMd5(serverName, client, remotePath, debug),
+      local.payload ? Promise.resolve(TransferService.md5Hex(local.payload)) : TransferService.md5OfFile(local.path),
+    ]);
+    if (remoteHash.status === "rejected") {
+      return { skip: false, reason: `remote-hash-failed(${(remoteHash.reason as Error).message})` };
+    }
+    if (localHash.status === "rejected") {
+      return { skip: false, reason: `local-hash-failed(${(localHash.reason as Error).message})` };
+    }
+    if (remoteHash.value === localHash.value) {
+      return { skip: true, reason: `identical-md5(${localHash.value}, ${remoteSize} bytes)` };
+    }
+    return { skip: false, reason: `md5-differs(local=${localHash.value}, remote=${remoteHash.value})` };
+  }
+
+  private static md5Hex(data: Buffer): string {
+    return crypto.createHash("md5").update(data).digest("hex");
+  }
+
+  /** Stream a local file through Node's native MD5; never buffers the file. */
+  private static async md5OfFile(filePath: string): Promise<string> {
+    const hash = crypto.createHash("md5");
+    for await (const chunk of fs.createReadStream(filePath)) {
+      hash.update(chunk as Buffer);
+    }
+    return hash.digest("hex");
   }
 
   private static uploadSkippedMessage(remotePath: string, localPath: string, reason: string, crlfNote: string): string {
     return `${TransferService.UPLOAD_SKIPPED_PREFIX} remote file '${remotePath}' is already identical to local ` +
       `'${localPath}' (${reason}).${crlfNote}`;
   }
-
-  /**
-   * Threshold above which we use MD5 hash comparison instead of byte-content
-   * comparison for skip-if-identical.
-   */
-  private static readonly SKIP_IF_IDENTICAL_HASH_THRESHOLD = 256 * 1024 * 1024;
 
   /**
    * Shell scripts that need CRLF→LF normalization on upload to a Linux host.
@@ -1383,312 +1551,8 @@ export class TransferService {
   }
 
   /**
-   * Decide whether an upload can be skipped because the remote file is
-   * already identical to the local payload.
-   *
-   * Strategy for regular files:
-   *   - If remote file does not exist → don't skip.
-   *   - If sizes differ → don't skip.
-   *   - If size ≤ 256 MiB → fetch remote bytes and byte-compare.
-   *   - Else → MD5 both sides and compare hashes.
-   *
-   * Strategy for shell scripts (lineEndingAgnostic=true):
-   *   The local payload has already been LF-normalized. We must compare
-   *   against an LF-normalized view of the remote file too, so a remote that
-   *   still contains CRLF is treated as equal to an LF-only local file.
-   *   Because remote-side md5sum runs on raw bytes (including CRLF), we
-   *   cannot use the hash branch — we always download the remote and
-   *   byte-compare after normalizing it.
-   *
-   * Any error during the check is treated as 'don't skip' (i.e. fall through
-   * to a normal upload), since correctness wins over an optimization.
-   */
-  private async shouldSkipUpload(
-    client: Client,
-    localPayload: Buffer,
-    remotePath: string,
-    lineEndingAgnostic: boolean,
-    timeout?: number,
-    debug?: SshDebugSink,
-  ): Promise<{ skip: boolean; reason: string }> {
-    let remoteSize: number;
-    try {
-      const sftp = await this.openSftp(client, "dest", timeout, debug);
-      try {
-        const stat = await this.sftpStat(sftp, remotePath, "dest");
-        remoteSize = stat.size;
-      } finally {
-        sftp.end();
-      }
-    } catch {
-      return { skip: false, reason: "remote-missing-or-unstat-able" };
-    }
-
-    if (lineEndingAgnostic) {
-      // For shell scripts we can't trust raw size: remote may have CRLF.
-      // Sanity-cap the remote download size to keep memory bounded.
-      if (remoteSize > TransferService.SKIP_IF_IDENTICAL_HASH_THRESHOLD) {
-        // Shell scripts this large are pathological; just re-upload.
-        return { skip: false, reason: `shell-script-too-large-for-content-compare(${remoteSize} bytes)` };
-      }
-      let remoteBuf: Buffer;
-      try {
-        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize, timeout, debug);
-      } catch {
-        return { skip: false, reason: "remote-read-failed-during-content-compare" };
-      }
-      const remoteNormalized = TransferService.normalizeCrlfToLf(remoteBuf);
-      if (
-        remoteNormalized.length === localPayload.length &&
-        remoteNormalized.equals(localPayload)
-      ) {
-        const note = remoteNormalized.length !== remoteBuf.length
-          ? `identical-content-ignoring-line-endings(${remoteNormalized.length} bytes after LF-normalization, remote raw was ${remoteBuf.length} bytes with CRLF)`
-          : `identical-content(${remoteNormalized.length} bytes)`;
-        return { skip: true, reason: note };
-      }
-      return { skip: false, reason: "content-differs-after-line-ending-normalization" };
-    }
-
-    // -------- Non-shell-script path --------
-
-    if (remoteSize !== localPayload.length) {
-      return { skip: false, reason: `size-differs(local=${localPayload.length},remote=${remoteSize})` };
-    }
-
-    if (remoteSize <= TransferService.SKIP_IF_IDENTICAL_HASH_THRESHOLD) {
-      // Byte-content compare
-      let remoteBuf: Buffer;
-      try {
-        remoteBuf = await this.sftpReadBuffer(client, remotePath, remoteSize, timeout, debug);
-      } catch {
-        return { skip: false, reason: "remote-read-failed-during-content-compare" };
-      }
-      if (remoteBuf.length === localPayload.length && remoteBuf.equals(localPayload)) {
-        return { skip: true, reason: `identical-content(${remoteSize} bytes)` };
-      }
-      return { skip: false, reason: "content-differs" };
-    }
-
-    // Large file → hash compare
-    const localMd5 = crypto.createHash("md5").update(localPayload).digest("hex");
-    let remoteMd5: string | null = null;
-    try {
-      remoteMd5 = await this.remoteMd5(client, remotePath);
-    } catch {
-      return { skip: false, reason: "remote-md5-unavailable" };
-    }
-    if (remoteMd5 === localMd5) {
-      return { skip: true, reason: `identical-md5(${localMd5}, ${remoteSize} bytes)` };
-    }
-    return { skip: false, reason: `md5-differs(local=${localMd5}, remote=${remoteMd5})` };
-  }
-
-  /**
-   * Skip-if-identical path for a fast upload. Unlike the buffered path, this
-   * never preloads the local file. Most uploads hit the size-different branch
-   * and can enter ssh2 fastPut immediately; equal-sized files are compared with
-   * streaming SHA-256 digests so memory remains bounded on every platform.
-   */
-  private async shouldSkipFastUpload(
-    client: Client,
-    localPath: string,
-    localSize: number,
-    remotePath: string,
-    timeout?: number,
-    debug?: SshDebugSink,
-  ): Promise<{ skip: boolean; reason: string }> {
-    let remoteSize: number;
-    try {
-      const sftp = await this.openSftp(client, "fast-upload-stat", timeout, debug);
-      try {
-        remoteSize = (await this.sftpStat(sftp, remotePath, "dest")).size;
-      } finally {
-        sftp.end();
-      }
-    } catch {
-      return { skip: false, reason: "remote-missing-or-unstat-able" };
-    }
-
-    if (remoteSize !== localSize) {
-      return { skip: false, reason: `size-differs(local=${localSize},remote=${remoteSize})` };
-    }
-
-    try {
-      const identical = await this.filesMatchByStreamingHash(
-        client,
-        localPath,
-        remotePath,
-        timeout,
-        debug,
-      );
-      return identical
-        ? { skip: true, reason: `identical-sha256(${localSize} bytes)` }
-        : { skip: false, reason: "content-differs" };
-    } catch {
-      // A failed optional comparison must not prevent the real upload.
-      return { skip: false, reason: "streamed-content-compare-unavailable" };
-    }
-  }
-
-  /**
-   * Compare one local and one remote file without buffering either whole file.
-   * The two streams are hashed independently because their chunk boundaries are
-   * not guaranteed to align. The same inactivity watchdog used by transfers
-   * makes a stale reused SFTP channel fail rather than hang this comparison.
-   */
-  private async filesMatchByStreamingHash(
-    client: Client,
-    localPath: string,
-    remotePath: string,
-    timeout?: number,
-    debug?: SshDebugSink,
-  ): Promise<boolean> {
-    const sftp = await this.openSftp(client, "fast-upload-compare", timeout, debug);
-    let localStream: fs.ReadStream | null = null;
-    let remoteStream: NodeJS.ReadableStream | null = null;
-    const cleanup = () => {
-      this.destroyStream(localStream);
-      this.destroyStream(remoteStream);
-      try {
-        sftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    };
-
-    try {
-      return await this.runWithInactivityTimeout<boolean>(
-        (onProgress) =>
-          new Promise<boolean>((resolve, reject) => {
-            const localHash = crypto.createHash("sha256");
-            const remoteHash = crypto.createHash("sha256");
-            let localDone = false;
-            let remoteDone = false;
-            let settled = false;
-
-            const fail = (error: Error) => {
-              if (settled) return;
-              settled = true;
-              cleanup();
-              reject(error);
-            };
-            const finish = () => {
-              if (settled || !localDone || !remoteDone) return;
-              settled = true;
-              resolve(localHash.digest("hex") === remoteHash.digest("hex"));
-            };
-
-            try {
-              localStream = fs.createReadStream(localPath);
-              remoteStream = sftp.createReadStream(remotePath);
-              localStream.on("data", (chunk: string | Buffer) => {
-                localHash.update(chunk);
-                onProgress();
-              });
-              remoteStream.on("data", (chunk: string | Buffer) => {
-                remoteHash.update(chunk);
-                onProgress();
-              });
-              localStream.on("end", () => {
-                localDone = true;
-                finish();
-              });
-              remoteStream.on("end", () => {
-                remoteDone = true;
-                finish();
-              });
-              localStream.on("error", (error: Error) => fail(error));
-              remoteStream.on("error", (error: Error) => fail(error));
-            } catch (error) {
-              fail(error as Error);
-            }
-          }),
-        this.transferStallTimeout(timeout),
-        `compare ${remotePath}`,
-        debug,
-        cleanup,
-      );
-    } finally {
-      cleanup();
-    }
-  }
-
-  /**
-   * Return a copy of `buf` with every CRLF replaced by LF. No-op if the
-   * buffer contains no CRLF.
-   */
-  private static normalizeCrlfToLf(buf: Buffer): Buffer {
-    if (buf.indexOf("\r\n") === -1) return buf;
-    return Buffer.from(
-      buf.toString("binary").replace(/\r\n/g, "\n"),
-      "binary",
-    );
-  }
-
-  /**
-   * Read an SFTP file fully into a Buffer.
-   *
-   * Guarded by an inactivity watchdog: if no bytes arrive for the stall window
-   * (a dead reused connection can open the channel but never stream) the read
-   * aborts with a retriable error instead of hanging. An actively-streaming
-   * read is never killed because each chunk resets the watchdog.
-   */
-  private async sftpReadBuffer(
-    client: Client,
-    remotePath: string,
-    expectedSize: number,
-    timeout?: number,
-    debug?: SshDebugSink,
-  ): Promise<Buffer> {
-    const sftp = await this.openSftp(client, "read", timeout, debug);
-    const endSftp = () => {
-      try {
-        sftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    };
-    try {
-      return await this.runWithInactivityTimeout<Buffer>(
-        (onProgress) =>
-          new Promise<Buffer>((resolve, reject) => {
-            const chunks: Buffer[] = [];
-            let received = 0;
-            const stream = sftp.createReadStream(remotePath);
-            stream.on("data", (chunk: Buffer) => {
-              chunks.push(chunk);
-              received += chunk.length;
-              onProgress();
-            });
-            stream.on("error", (e: Error) => {
-              reject(this.makeSftpError("Remote read failed", e));
-            });
-            stream.on("end", () => {
-              if (received !== expectedSize) {
-                return reject(
-                  new ToolError(
-                    "SFTP_ERROR",
-                    `Remote read short: expected ${expectedSize} bytes, got ${received}`,
-                    false,
-                  ),
-                );
-              }
-              resolve(Buffer.concat(chunks, received));
-            });
-          }),
-        this.transferStallTimeout(timeout),
-        `remote read ${remotePath}`,
-        debug,
-        endSftp,
-      );
-    } finally {
-      endSftp();
-    }
-  }
-
-  /**
-   * Write a Buffer to an SFTP path (overwrites if exists).
+   * Write a Buffer to an SFTP path (overwrites if exists) on an open session.
+   * Only the serial `fast:false` upload uses this.
    *
    * The payload is written in chunks so the inactivity watchdog gets a real
    * progress signal per acknowledged chunk: a dead reused connection that opens
@@ -1696,13 +1560,12 @@ export class TransferService {
    * hanging, while an actively-flushing write is never killed.
    */
   private async sftpWriteBuffer(
-    client: Client,
+    sftp: SFTPWrapper,
     remotePath: string,
     payload: Buffer,
     timeout?: number,
     debug?: SshDebugSink,
   ): Promise<void> {
-    const sftp = await this.openSftp(client, "write", timeout, debug);
     const endSftp = () => {
       try {
         sftp.end();
@@ -1710,158 +1573,122 @@ export class TransferService {
         // Ignore late SFTP cleanup errors.
       }
     };
-    try {
-      await this.runWithInactivityTimeout<void>(
-        (onProgress) =>
-          new Promise<void>((resolve, reject) => {
-            const writeStream = sftp.createWriteStream(remotePath);
-            let offset = 0;
-            let ended = false;
+    await this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          const writeStream = sftp.createWriteStream(remotePath);
+          let offset = 0;
+          let ended = false;
 
-            writeStream.on("close", () => resolve());
-            writeStream.on("error", (e: Error) => {
-              reject(this.makeSftpError("File upload failed", e));
-            });
+          writeStream.on("close", () => resolve());
+          writeStream.on("error", (e: Error) => {
+            reject(this.makeSftpError("File upload failed", e));
+          });
 
-            const writeNext = () => {
-              if (offset >= payload.length) {
-                if (!ended) {
-                  ended = true;
-                  writeStream.end();
-                }
+          const writeNext = () => {
+            if (offset >= payload.length) {
+              if (!ended) {
+                ended = true;
+                writeStream.end();
+              }
+              return;
+            }
+            const end = Math.min(offset + TransferService.SFTP_WRITE_CHUNK_BYTES, payload.length);
+            const chunk = payload.subarray(offset, end);
+            offset = end;
+            writeStream.write(chunk, (err?: Error | null) => {
+              if (err) {
+                // The "error" event will reject; nothing else to do here.
                 return;
               }
-              const end = Math.min(offset + TransferService.SFTP_WRITE_CHUNK_BYTES, payload.length);
-              const chunk = payload.subarray(offset, end);
-              offset = end;
-              writeStream.write(chunk, (err?: Error | null) => {
-                if (err) {
-                  // The "error" event will reject; nothing else to do here.
-                  return;
-                }
-                onProgress();
-                writeNext();
-              });
-            };
+              onProgress();
+              writeNext();
+            });
+          };
 
-            writeNext();
-          }),
-        this.transferStallTimeout(timeout),
-        `upload ${remotePath}`,
-        debug,
-        endSftp,
-      );
-    } finally {
-      endSftp();
-    }
+          writeNext();
+        }),
+      this.transferStallTimeout(timeout),
+      `upload ${remotePath}`,
+      debug,
+      endSftp,
+    );
   }
 
   /**
-   * Upload a local file using ssh2's parallel SFTP fastPut implementation.
+   * Upload a local file with ssh2's pipelined fastPut on an open session.
    */
   private async sftpFastPut(
-    client: Client,
+    sftp: SFTPWrapper,
     localPath: string,
     remotePath: string,
     options: SftpOptions | undefined,
     timeout?: number,
     debug?: SshDebugSink,
   ): Promise<void> {
-    // Validate transfer options BEFORE opening the channel so invalid options
-    // can never leak an SFTP channel.
     const transferOptions = this.createSftpTransferOptions(options);
-    const sftp = await this.openSftp(client, "fastPut", timeout, debug);
     debug?.(
       `[mcp] fastPut ${localPath} -> ${remotePath}, concurrency=${transferOptions.concurrency ?? "ssh2-default"}, chunkSize=${transferOptions.chunkSize ?? "ssh2-default"}`,
     );
-
-    const endSftp = () => {
-      try {
-        sftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    };
-
-    try {
-      await this.runWithInactivityTimeout<void>(
-        (onProgress) =>
-          new Promise<void>((resolve, reject) => {
-            sftp.fastPut(
-              localPath,
-              remotePath,
-              { ...transferOptions, step: () => onProgress() },
-              (err?: Error | null) => {
-                if (err) {
-                  reject(this.makeSftpError("Fast upload failed", err));
-                  return;
-                }
-                resolve();
-              },
-            );
-          }),
-        this.transferStallTimeout(timeout),
-        `fast upload ${localPath} -> ${remotePath}`,
-        debug,
-        endSftp,
-      );
-    } finally {
-      endSftp();
-    }
+    await this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          sftp.fastPut(
+            localPath,
+            remotePath,
+            { ...transferOptions, step: () => onProgress() },
+            (err?: Error | null) => {
+              if (err) {
+                reject(this.makeSftpError("Fast upload failed", err));
+                return;
+              }
+              resolve();
+            },
+          );
+        }),
+      this.transferStallTimeout(timeout),
+      `fast upload ${localPath} -> ${remotePath}`,
+      debug,
+      () => { try { sftp.end(); } catch { /* ignore late SFTP cleanup errors */ } },
+    );
   }
 
   /**
-   * Download a remote file using ssh2's parallel SFTP fastGet implementation.
+   * Download a remote file with ssh2's pipelined fastGet on an open session.
    */
   private async sftpFastGet(
-    client: Client,
+    sftp: SFTPWrapper,
     remotePath: string,
     localPath: string,
     options: SftpOptions | undefined,
     timeout?: number,
     debug?: SshDebugSink,
   ): Promise<void> {
-    // Validate transfer options BEFORE opening the channel so invalid options
-    // can never leak an SFTP channel.
     const transferOptions = this.createSftpTransferOptions(options);
-    const sftp = await this.openSftp(client, "fastGet", timeout, debug);
     debug?.(
       `[mcp] fastGet ${remotePath} -> ${localPath}, concurrency=${transferOptions.concurrency ?? "ssh2-default"}, chunkSize=${transferOptions.chunkSize ?? "ssh2-default"}`,
     );
-
-    const endSftp = () => {
-      try {
-        sftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    };
-
-    try {
-      await this.runWithInactivityTimeout<void>(
-        (onProgress) =>
-          new Promise<void>((resolve, reject) => {
-            sftp.fastGet(
-              remotePath,
-              localPath,
-              { ...transferOptions, step: () => onProgress() },
-              (err?: Error | null) => {
-                if (err) {
-                  reject(this.makeSftpError("Fast download failed", err));
-                  return;
-                }
-                resolve();
-              },
-            );
-          }),
-        this.transferStallTimeout(timeout),
-        `fast download ${remotePath} -> ${localPath}`,
-        debug,
-        endSftp,
-      );
-    } finally {
-      endSftp();
-    }
+    await this.runWithInactivityTimeout<void>(
+      (onProgress) =>
+        new Promise<void>((resolve, reject) => {
+          sftp.fastGet(
+            remotePath,
+            localPath,
+            { ...transferOptions, step: () => onProgress() },
+            (err?: Error | null) => {
+              if (err) {
+                reject(this.makeSftpError("Fast download failed", err));
+                return;
+              }
+              resolve();
+            },
+          );
+        }),
+      this.transferStallTimeout(timeout),
+      `fast download ${remotePath} -> ${localPath}`,
+      debug,
+      () => { try { sftp.end(); } catch { /* ignore late SFTP cleanup errors */ } },
+    );
   }
 
   /**
@@ -1874,7 +1701,6 @@ export class TransferService {
     options?: SftpOptions,
   ): Promise<string> {
     const resolvedName = name || this.pool.defaultName;
-    const reuseConnection = options?.reuseConnection !== false;
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
     const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
     const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
@@ -1899,63 +1725,46 @@ export class TransferService {
         // This path runs on transfer lanes, never on the cached command
         // client, and a failed transfer closes its lanes instead of pooling
         // them -- nothing a failure here touched can be poisoned, so unlike
-        // the branches below this never calls this.pool.closeClient().
+        // the branch below this never calls this.pool.closeClient().
         throw appendDebugToError(error as Error, debugCollector);
       }
     }
 
-    debug?.(`[mcp] sftp download on [${resolvedName}], reuseConnection=${reuseConnection}`);
-    let connection: AcquiredSshClient | null = null;
+    debug?.(`[mcp] sftp download on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
+    const scope = this.openTransferScope(resolvedName, options, debug);
     try {
-      connection = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection,
-        timeout: options?.timeout,
-        debug,
-        purpose: "sftp",
-      });
-
-      if (options?.fast === true) {
-        await this.sftpFastGet(
-          connection.client,
-          validatedRemotePath,
-          validatedLocalPath,
-          options,
-          options?.timeout,
-          debug,
-        );
-        return appendDebugOutput(
-          "File downloaded successfully via fast SFTP",
-          debugCollector,
-        );
-      }
-
-      const sftp = await this.openSftp(connection.client, "download", options?.timeout, debug);
-      try {
-        await this.pipeWithInactivityTimeout(
-          sftp.createReadStream(validatedRemotePath),
-          fs.createWriteStream(validatedLocalPath),
-          this.transferStallTimeout(options?.timeout),
-          `download ${validatedRemotePath} -> ${validatedLocalPath}`,
-          debug,
-          (err) => this.makeSftpError("File download failed", err),
-          (err) => new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false),
-        );
-      } finally {
-        try {
-          sftp.end();
-        } catch {
-          // Ignore late SFTP cleanup errors.
-        }
-      }
-      return appendDebugOutput("File downloaded successfully", debugCollector);
+      const message = await scope.run(0, (_client, sftp) =>
+        this.downloadFileOn(sftp, validatedRemotePath, validatedLocalPath, options, debug));
+      return appendDebugOutput(message, debugCollector);
     } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(resolvedName, true);
-      }
       throw appendDebugToError(error as Error, debugCollector);
     } finally {
-      connection?.close();
+      await scope.close();
     }
+  }
+
+  /** The per-file download core, on a session the caller already opened. */
+  private async downloadFileOn(
+    sftp: SFTPWrapper,
+    remotePath: string,
+    localPath: string,
+    options: SftpOptions | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string> {
+    if (options?.fast !== false) {
+      await this.sftpFastGet(sftp, remotePath, localPath, options, options?.timeout, debug);
+      return "File downloaded successfully via fast SFTP";
+    }
+    await this.pipeWithInactivityTimeout(
+      sftp.createReadStream(remotePath),
+      fs.createWriteStream(localPath),
+      this.transferStallTimeout(options?.timeout),
+      `download ${remotePath} -> ${localPath}`,
+      debug,
+      (err) => this.makeSftpError("File download failed", err),
+      (err) => new ToolError("LOCAL_FILE_WRITE_FAILED", `Failed to save file: ${err.message}`, false),
+    );
+    return "File downloaded successfully";
   }
 
   /**
@@ -2138,18 +1947,15 @@ export class TransferService {
    */
   private async uploadMultiConnection(
     resolvedName: string,
-    localPath: string,
     remotePath: string,
-    payload: Buffer | null,
-    size: number,
-    isShellScript: boolean,
+    source: UploadSource,
     skipIfIdentical: boolean,
-    crlfNote: string,
     connections: number,
     timeout: number | undefined,
     debug: SshDebugSink | undefined,
     fresh: boolean,
   ): Promise<string> {
+    const { path: localPath, payload, size, crlfNote } = source;
     const lanes: TransferLane[] = [];
     const sftpSessions: SFTPWrapper[] = [];
     let remoteTempPath: string | null = null;
@@ -2164,8 +1970,9 @@ export class TransferService {
 
       if (skipIfIdentical) {
         const decision = await this.decideUploadSkip(
-          lanes[0].client, payload, localPath, size, remotePath, isShellScript, timeout, debug,
+          lanes[0].client, sftpSessions[0], resolvedName, remotePath, source, timeout, debug,
         );
+        debug?.(`[mcp] upload skip check for ${remotePath}: ${decision.skip ? "skip" : "upload"} (${decision.reason})`);
         if (decision.skip) {
           succeeded = true;
           return TransferService.uploadSkippedMessage(remotePath, localPath, decision.reason, crlfNote);
@@ -2598,14 +2405,45 @@ export class TransferService {
     // Validated before any probe or connection, so an invalid request opens
     // nothing on either server.
     const connections = this.resolveTransferConnections(options);
-    if (connections > 1) {
-      if (strategy !== "relay") {
-        throw new ToolError(
-          "INVALID_CONFIGURATION",
-          `connections is only supported with strategy="relay", not strategy="${strategy}"`,
-          false,
+    if (connections > 1 && strategy !== "relay") {
+      throw new ToolError(
+        "INVALID_CONFIGURATION",
+        `connections is only supported with strategy="relay", not strategy="${strategy}"`,
+        false,
+      );
+    }
+
+    // Same server on both ends: when its SFTP server can copy a file itself
+    // (copy-data), the bytes never need to travel at all. `connections` is
+    // moot on that path, and strategy="direct" keeps its own meaning.
+    if (sourceName === destName && strategy !== "direct") {
+      const { collector, debug } = createDebugCollector(options?.vvv === true);
+      try {
+        const copied = await this.copyOnServer(sourceName, sourceRemotePath, destRemotePath, options, debug);
+        if (copied !== null) {
+          return appendDebugOutput(copied, collector);
+        }
+        const result = await this.transferBetweenServersByStrategy(
+          strategy, connections, sourceName, sourceRemotePath, destName, destRemotePath, options,
         );
+        return appendDebugOutput(result, collector);
+      } catch (error) {
+        throw appendDebugToError(error as Error, collector);
       }
+    }
+    return this.transferBetweenServersByStrategy(strategy, connections, sourceName, sourceRemotePath, destName, destRemotePath, options);
+  }
+
+  private async transferBetweenServersByStrategy(
+    strategy: TransferStrategy,
+    connections: number,
+    sourceName: string,
+    sourceRemotePath: string,
+    destName: string,
+    destRemotePath: string,
+    options?: SftpOptions & { skipIfIdentical?: boolean },
+  ): Promise<string> {
+    if (connections > 1) {
       return this.transferBetweenServersMultiConnection(sourceName, sourceRemotePath, destName, destRemotePath, connections, options);
     }
     if (strategy === "relay") {
@@ -2630,6 +2468,173 @@ export class TransferService {
     }
     const relayResult = await this.transferBetweenServersRelay(sourceName, sourceRemotePath, destName, destRemotePath, options);
     return `auto strategy: direct transfer not possible (${probe.reason ?? "no usable direct backend"}); fell back to relay.\n${relayResult}`;
+  }
+
+  /** Per-server copy-data support, negative result included; see detectRemoteHashCommand for the caching rules. */
+  private readonly copyDataSupport = new Map<string, Promise<boolean>>();
+
+  /**
+   * Whether the server's SFTP advertises copy-data. ssh2 exposes the
+   * advertised extensions only as the `_extensions` field of an open session
+   * (the typed ext_copy_data throws when it is not advertised), so the probe
+   * opens one session, reads it and closes it. Cached per server identity;
+   * concurrent first probes share one Promise; a probe that fails to run
+   * (connection error) is not cached.
+   */
+  private detectCopyData(name: string, options: SftpOptions | undefined, debug: SshDebugSink | undefined): Promise<boolean> {
+    const key = this.serverIdentity(name);
+    let detection = this.copyDataSupport.get(key);
+    if (!detection) {
+      detection = (async () => {
+        const connection = await this.pool.acquireSshClient(name, {
+          reuseConnection: options?.reuseConnection !== false,
+          timeout: options?.timeout,
+          debug,
+          purpose: "sftp",
+        });
+        try {
+          const sftp = await this.openSftp(connection.client, "copy-data-probe", options?.timeout, debug);
+          try {
+            return (sftp as unknown as { _extensions?: Record<string, string> })._extensions?.["copy-data"] === "1";
+          } finally {
+            try { sftp.end(); } catch { /* ignore late SFTP cleanup errors */ }
+          }
+        } finally {
+          connection.close();
+        }
+      })();
+      this.copyDataSupport.set(key, detection);
+      const pending = detection;
+      pending.catch(() => {
+        if (this.copyDataSupport.get(key) === pending) this.copyDataSupport.delete(key);
+      });
+    }
+    return detection;
+  }
+
+  /**
+   * Server-side file copy for a same-server transfer (PLAN.MD P1-06c W4):
+   * the SFTP server copies the bytes itself via the copy-data extension
+   * (OpenSSH 9.0+; ssh2's ext_copy_data), so nothing crosses the network or
+   * this host. Resolves null when the server does not advertise copy-data,
+   * and the caller falls back to the client-side relay.
+   *
+   * The copy goes to a NEW temp file next to the target, is size- and
+   * md5-verified, and only then replaces the target (replaceRemoteFile), so a
+   * failure at any step removes the temp file and leaves the target as it
+   * was. Writing a new inode also means source and destination can never be
+   * the same file, which OpenSSH before 2026-05-31 did not check for.
+   *
+   * The copy is split into 64 MiB requests, each reply feeding the inactivity
+   * watchdog: a single len=0 request (what OpenSSH's own `sftp cp` sends)
+   * reports nothing until the whole file is done, so a large file would trip
+   * the 60 s watchdog while healthy.
+   */
+  private async copyOnServer(
+    name: string,
+    sourceRemotePath: string,
+    destRemotePath: string,
+    options: (SftpOptions & { skipIfIdentical?: boolean }) | undefined,
+    debug: SshDebugSink | undefined,
+  ): Promise<string | null> {
+    const sourcePath = this.validateRemotePath(sourceRemotePath, name);
+    const destPath = this.validateRemotePath(destRemotePath, name);
+    const reuseConnection = options?.reuseConnection !== false;
+    const timeout = options?.timeout;
+    let connection: AcquiredSshClient | null = null;
+    let sftp: SFTPWrapper | null = null;
+    let tempPath: string | null = null;
+    try {
+      if (!(await this.detectCopyData(name, options, debug))) {
+        debug?.(`[mcp] same-server transfer on [${name}]: server-side copy-data is not advertised by the SFTP server; using the client-side relay`);
+        return null;
+      }
+      debug?.(`[mcp] same-server transfer on [${name}]: using server-side copy-data`);
+      connection = await this.pool.acquireSshClient(name, { reuseConnection, timeout, debug, purpose: "sftp" });
+      const client = connection.client;
+      sftp = await this.openSftp(client, "copy-data", timeout, debug);
+
+      const sourceSize = (await this.sftpStat(sftp, sourcePath, "source")).size;
+      if (options?.skipIfIdentical !== false) {
+        const skipped = await this.relaySkipIfIdentical(name, name, client, client, sftp, sourcePath, destPath, sourceSize);
+        if (skipped) return skipped;
+      }
+
+      const temp = `${destPath}.handfree-copy-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+      const copySftp = sftp;
+      let sourceHandle: Buffer | null = null;
+      let destHandle: Buffer | null = null;
+      tempPath = temp;
+      try {
+        sourceHandle = await this.sftpOpenFile(copySftp, sourcePath, "r", (error) => this.makeSftpError("Source open error", error));
+        destHandle = await this.sftpOpenFile(copySftp, temp, "w", (error) => this.makeSftpError("Dest open error", error));
+        const handles = { source: sourceHandle, dest: destHandle };
+        await this.runWithInactivityTimeout<void>(
+          async (onProgress) => {
+            for (let offset = 0; offset < sourceSize; offset += TransferService.COPY_DATA_CHUNK_BYTES) {
+              const length = Math.min(TransferService.COPY_DATA_CHUNK_BYTES, sourceSize - offset);
+              await new Promise<void>((resolve, reject) => {
+                copySftp.ext_copy_data(handles.source, offset, length, handles.dest, offset, (error?: Error | null) =>
+                  error ? reject(this.makeSftpError("Server-side copy error", error)) : resolve());
+              });
+              onProgress();
+            }
+          },
+          this.transferStallTimeout(timeout),
+          `server-side copy ${name}:${sourcePath} -> ${destPath}`,
+          debug,
+          () => { try { copySftp.end(); } catch { /* already gone */ } },
+        );
+        // Close before verifying so every acknowledged byte is visible.
+        await this.sftpCloseFile(copySftp, destHandle);
+        destHandle = null;
+        await this.sftpCloseFile(copySftp, sourceHandle);
+        sourceHandle = null;
+      } finally {
+        for (const handle of [sourceHandle, destHandle]) {
+          if (handle) {
+            try { copySftp.close(handle, () => {}); } catch { /* channel already gone */ }
+          }
+        }
+      }
+
+      const tempSize = (await this.sftpStat(sftp, temp, "dest")).size;
+      if (tempSize !== sourceSize) {
+        throw new ToolError(
+          "SFTP_ERROR",
+          `Transfer verification failed: size mismatch (source=${sourceSize} bytes, dest=${tempSize} bytes)`,
+          true,
+        );
+      }
+      const verification = [`size=${sourceSize} bytes ✓`];
+      const [sourceMd5, tempMd5] = await Promise.all([
+        this.remoteMd5(name, client, sourcePath, debug).catch(() => null),
+        this.remoteMd5(name, client, temp, debug).catch(() => null),
+      ]);
+      if (sourceMd5 && tempMd5) {
+        if (sourceMd5 !== tempMd5) {
+          throw new ToolError("SFTP_ERROR", `Transfer verification failed: MD5 mismatch (source=${sourceMd5}, dest=${tempMd5})`, true);
+        }
+        verification.push(`md5=${sourceMd5} ✓`);
+      }
+
+      await this.replaceRemoteFile(sftp, temp, destPath, debug);
+      tempPath = null;
+      const config = this.pool.getConfig(name);
+      return `Transfer complete (server-side copy-data on [${name}]; no file data passed through the MCP host; verified: ${verification.join(", ")}): ` +
+        `${config.username}@${config.host}:${sourcePath} → ${config.username}@${config.host}:${destPath}`;
+    } catch (error) {
+      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
+        this.pool.closeClient(name, true);
+      }
+      throw error;
+    } finally {
+      try { sftp?.end(); } catch { /* ignore late SFTP cleanup errors */ }
+      connection?.close();
+      if (tempPath) {
+        await this.removeRemoteFileBestEffort(name, tempPath, timeout, debug);
+      }
+    }
   }
 
   /**
@@ -2781,8 +2786,8 @@ export class TransferService {
         ? srcConnection
         : await this.pool.acquireSshClient(destName, { reuseConnection, timeout: options?.timeout, debug, purpose: "command" });
       const [srcMd5, dstMd5] = await Promise.all([
-        this.remoteMd5(srcConnection.client, validatedSourcePath).catch(() => null),
-        this.remoteMd5(dstConnection.client, validatedDestPath).catch(() => null),
+        this.remoteMd5(sourceName, srcConnection.client, validatedSourcePath, debug).catch(() => null),
+        this.remoteMd5(destName, dstConnection.client, validatedDestPath, debug).catch(() => null),
       ]);
       if (srcMd5 && dstMd5 && srcMd5 !== dstMd5) {
         throw new ToolError(
@@ -2809,10 +2814,10 @@ export class TransferService {
    * Run `command` on server `name` via a plain exec channel and capture its
    * exit code plus bounded stdout/stderr tails, WITHOUT throwing on a
    * non-zero exit -- callers (probe/direct execution) need to classify
-   * failure, not just detect it. `execTimeoutMs` bounds the whole call
-   * (channel open + run); omit it for an operation whose duration should not
-   * be capped by this (matching relay/upload/download's own "timeout bounds
-   * setup, not stream duration" contract).
+   * failure, not just detect it. `execTimeoutMs` bounds the run; omit it for
+   * an operation whose duration should not be capped by this (matching
+   * relay/upload/download's own "timeout bounds setup, not stream duration"
+   * contract). Opening the channel is always bounded by `options.timeout`.
    */
   private async execCapture(
     name: string,
@@ -2830,49 +2835,7 @@ export class TransferService {
         debug,
         purpose: "command",
       });
-      const stream = await this.pool.withConnectionTimeout(
-        new Promise<ClientChannel>((resolve, reject) => {
-          connection!.client.exec(command, (error, channel) => {
-            if (error) {
-              reject(this.pool.isConnectionShapedMessage(error.message)
-                ? new ToolError("SSH_CONNECTION_FAILED", `Failed to open direct-transfer command channel on [${name}]: ${error.message}`, true)
-                : new ToolError("COMMAND_EXECUTION_ERROR", `Failed to open direct-transfer command channel on [${name}]: ${error.message}`, false));
-              return;
-            }
-            resolve(channel);
-          });
-        }),
-        this.pool.normalizeConnectTimeout(options?.timeout),
-        `Direct-transfer command channel open on [${name}]`,
-        debug,
-      );
-      const drain = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-        const stdoutCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
-        const stderrCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
-        let settled = false;
-        const finish = (code: number | null, error?: Error) => {
-          if (settled) return;
-          settled = true;
-          if (error) { reject(error); return; }
-          resolve({
-            code,
-            stdout: stdoutCollector.getSnapshot().tail.toString("utf8"),
-            stderr: stderrCollector.getSnapshot().tail.toString("utf8"),
-          });
-        };
-        stream.on("data", (chunk: Buffer) => stdoutCollector.push(chunk));
-        stream.stderr.on("data", (chunk: Buffer) => stderrCollector.push(chunk));
-        stream.on("error", (error: Error) => finish(null, this.makeSftpError(`Direct-transfer command failed on [${name}]`, error)));
-        stream.on("exit", (code: number | null) => finish(code));
-        stream.on("close", (code: number | null) => finish(code));
-      });
-      return await this.pool.withConnectionTimeout(
-        drain,
-        execTimeoutMs,
-        `Direct-transfer command run on [${name}]`,
-        debug,
-        () => { try { stream.close(); } catch { /* already closed */ } },
-      );
+      return await this.execOnClient(connection.client, command, execTimeoutMs, debug, this.pool.normalizeConnectTimeout(options?.timeout));
     } catch (error) {
       if (reuseConnection && this.pool.isConnectionError(error as Error)) {
         this.pool.closeClient(name, true);
@@ -2883,10 +2846,74 @@ export class TransferService {
     }
   }
 
+  /**
+   * Run `command` on an already-acquired client and collect the result.
+   * stdin is closed as soon as the channel opens (EOF, like Go's
+   * ssh.Session.Run with no Stdin set), so a command that reads stdin sees an
+   * empty input instead of waiting forever. The remote hash command
+   * detection relies on this: bare `md5sum` must hash the empty input.
+   * `timeoutMs` bounds the run; `openTimeoutMs` (default: `timeoutMs`) bounds
+   * opening the channel.
+   */
+  private async execOnClient(
+    client: Client,
+    command: string,
+    timeoutMs: number | undefined,
+    debug?: SshDebugSink,
+    openTimeoutMs?: number,
+  ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const stream = await this.pool.withConnectionTimeout(
+      new Promise<ClientChannel>((resolve, reject) => {
+        client.exec(command, (error, channel) => {
+          if (error) {
+            reject(this.pool.isConnectionShapedMessage(error.message)
+              ? new ToolError("SSH_CONNECTION_FAILED", `Failed to open command channel: ${error.message}`, true)
+              : new ToolError("COMMAND_EXECUTION_ERROR", `Failed to open command channel: ${error.message}`, false));
+            return;
+          }
+          resolve(channel);
+        });
+      }),
+      openTimeoutMs ?? timeoutMs,
+      "Command channel open",
+      debug,
+    );
+    stream.end();
+    const drain = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const stdoutCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
+      const stderrCollector = new OutputCollector(TransferService.ARCHIVE_ERROR_OUTPUT_BYTES);
+      let settled = false;
+      const finish = (code: number | null, error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) { reject(error); return; }
+        resolve({
+          code,
+          stdout: stdoutCollector.getSnapshot().tail.toString("utf8"),
+          stderr: stderrCollector.getSnapshot().tail.toString("utf8"),
+        });
+      };
+      stream.on("data", (chunk: Buffer) => stdoutCollector.push(chunk));
+      stream.stderr.on("data", (chunk: Buffer) => stderrCollector.push(chunk));
+      stream.on("error", (error: Error) => finish(null, this.makeSftpError("Command failed", error)));
+      stream.on("exit", (code: number | null) => finish(code));
+      stream.on("close", (code: number | null) => finish(code));
+    });
+    return this.pool.withConnectionTimeout(
+      drain,
+      timeoutMs,
+      "Command run",
+      debug,
+      () => { try { stream.close(); } catch { /* already closed */ } },
+    );
+  }
+
   // PLAN.MD P1-08a probe timings. Not user-configurable -- these bound
   // internal diagnostic exec calls (version checks, one non-interactive
   // connectivity probe), not the actual data transfer.
   private static readonly DEFAULT_DIRECT_PROBE_TIMEOUT_MS = 8000;
+  /** Size of one server-side copy-data request (see copyOnServer). */
+  private static readonly COPY_DATA_CHUNK_BYTES = 64 * 1024 * 1024;
   private static readonly DEFAULT_DIRECT_CONNECT_TIMEOUT_SECONDS = 6;
 
   /**
@@ -2909,8 +2936,8 @@ export class TransferService {
     const dstStatProbe = await this.sftpStat(dstSftp, destPath, "dest").catch(() => null);
     if (!dstStatProbe || dstStatProbe.size !== sourceSize) return null;
     const [srcMd5, dstMd5] = await Promise.all([
-      this.remoteMd5(srcClient, sourcePath).catch(() => null),
-      this.remoteMd5(dstClient, destPath).catch(() => null),
+      this.remoteMd5(sourceName, srcClient, sourcePath).catch(() => null),
+      this.remoteMd5(destName, dstClient, destPath).catch(() => null),
     ]);
     if (!srcMd5 || !dstMd5 || srcMd5 !== dstMd5) return null;
     const srcConfig = this.pool.getConfig(sourceName);
@@ -3062,8 +3089,8 @@ export class TransferService {
       }
       verification.push(`size=${sourceSize} bytes ✓`);
       const [srcMd5, dstMd5] = await Promise.all([
-        this.remoteMd5(srcClient, validatedSourcePath).catch(() => null),
-        this.remoteMd5(dstClient, tempPath).catch(() => null),
+        this.remoteMd5(sourceName, srcClient, validatedSourcePath, debug).catch(() => null),
+        this.remoteMd5(destName, dstClient, tempPath, debug).catch(() => null),
       ]);
       if (srcMd5 && dstMd5) {
         if (srcMd5 !== dstMd5) {
@@ -3220,8 +3247,8 @@ export class TransferService {
 
       // MD5 check (best-effort: if md5sum is available on both servers)
       const [srcMd5, dstMd5] = await Promise.all([
-        this.remoteMd5(srcClient, sourceRemotePath).catch(() => null),
-        this.remoteMd5(dstClient, destRemotePath).catch(() => null),
+        this.remoteMd5(sourceName, srcClient, sourceRemotePath, debug).catch(() => null),
+        this.remoteMd5(destName, dstClient, destRemotePath, debug).catch(() => null),
       ]);
 
       if (srcMd5 && dstMd5) {
@@ -3445,24 +3472,91 @@ export class TransferService {
   }
 
   /**
-   * Compute MD5 of a remote file via ssh exec. Returns null if md5sum is unavailable.
+   * Remote hash command candidates, tried in this order. Ported from rclone
+   * (backend/sftp/sftp.go Hashes()): `md5sum` (GNU/BusyBox), `md5 -r` (BSD and
+   * macOS, prints "<hash> <file>" like md5sum) and `rclone md5sum`.
    */
-  private remoteMd5(client: Client, remotePath: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      client.exec(`md5sum ${this.shellQuote(remotePath)}`, (err, stream) => {
-        if (err) return reject(err);
+  private static readonly REMOTE_HASH_CANDIDATES = ["md5sum", "md5 -r", "rclone md5sum"];
+  /** MD5 of zero bytes; a candidate is trusted only if it prints this for empty input. */
+  private static readonly EMPTY_INPUT_MD5 = "d41d8cd98f00b204e9800998ecf8427e";
 
-        let data = "";
-        stream.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-        stream.stderr.on("data", () => { /* ignore stderr */ });
-        stream.on("close", (code: number) => {
-          if (code !== 0) return reject(new Error("md5sum failed"));
-          const hash = data.trim().split(/\s+/)[0];
-          if (!hash || hash.length !== 32) return reject(new Error("unexpected md5sum output"));
-          resolve(hash);
-        });
+  /**
+   * Per-server result of remote hash command detection, including the
+   * negative result (null), keyed by server identity so a config reload that
+   * changes the host gets a fresh probe. Concurrent first detections share
+   * one in-flight Promise. A detection that fails to run at all (connection
+   * error) is NOT cached: only a definite answer is.
+   */
+  private readonly remoteHashCommands = new Map<string, Promise<string | null>>();
+
+  /**
+   * First field of the output, leading backslash stripped, lowercased. Ported
+   * from rclone parseHash: GNU md5sum prefixes the line with a backslash when
+   * the file name contains a backslash or newline.
+   */
+  private static parseHashOutput(stdout: string): string {
+    return stdout.trimStart().replace(/^\\/, "").split(/\s+/)[0].toLowerCase();
+  }
+
+  /** Cache key for per-server capability detection: a config reload that changes the host gets a fresh probe. */
+  private serverIdentity(serverName: string): string {
+    const config = this.pool.getConfig(serverName);
+    return `${serverName}|${config.host}|${config.port}|${config.username}`;
+  }
+
+  /**
+   * Find a hash command that works on this server (ported from rclone
+   * backend/sftp/sftp.go checkHash): run each candidate with EMPTY stdin and
+   * accept the first whose output is the MD5 of empty input. That validates
+   * the tool really prints an MD5 in the expected format, not just that the
+   * name exists. Resolves null when none works.
+   */
+  private detectRemoteHashCommand(serverName: string, client: Client, debug: SshDebugSink | undefined): Promise<string | null> {
+    const key = this.serverIdentity(serverName);
+    let detection = this.remoteHashCommands.get(key);
+    if (!detection) {
+      detection = (async () => {
+        for (const candidate of TransferService.REMOTE_HASH_CANDIDATES) {
+          const result = await this.execOnClient(client, candidate, TransferService.DEFAULT_DIRECT_PROBE_TIMEOUT_MS, debug);
+          if (result.code === 0 && TransferService.parseHashOutput(result.stdout) === TransferService.EMPTY_INPUT_MD5) {
+            debug?.(`[mcp] remote hash command on [${serverName}]: ${candidate}`);
+            return candidate;
+          }
+        }
+        debug?.(`[mcp] no usable remote hash command on [${serverName}]`);
+        return null;
+      })();
+      this.remoteHashCommands.set(key, detection);
+      const pending = detection;
+      pending.catch(() => {
+        if (this.remoteHashCommands.get(key) === pending) this.remoteHashCommands.delete(key);
       });
-    });
+    }
+    return detection;
+  }
+
+  /**
+   * MD5 of a remote file, computed on the server by the detected hash command
+   * so no file content crosses the network. Resolves null when the server has
+   * no usable hash command; rejects when the command itself fails.
+   */
+  private async remoteMd5(
+    serverName: string,
+    client: Client,
+    remotePath: string,
+    debug?: SshDebugSink,
+  ): Promise<string | null> {
+    const command = await this.detectRemoteHashCommand(serverName, client, debug);
+    if (!command) return null;
+    const result = await this.execOnClient(client, `${command} ${this.shellQuote(remotePath)}`, undefined, debug);
+    if (result.code !== 0) {
+      throw new ToolError("SFTP_ERROR", `${command} failed on [${serverName}] (exit ${result.code ?? "unknown"}): ${result.stderr.trim().slice(-200)}`, false);
+    }
+    const hash = TransferService.parseHashOutput(result.stdout);
+    if (!/^[0-9a-f]{32}$/.test(hash)) {
+      throw new ToolError("SFTP_ERROR", `unexpected ${command} output on [${serverName}]`, false);
+    }
+    return hash;
   }
 
   /**
@@ -3711,23 +3805,11 @@ export class TransferService {
     options: SftpOptions | undefined,
     debug: SshDebugSink | undefined,
   ): Promise<void> {
-    const reuseConnection = options?.reuseConnection !== false;
-    let connection: AcquiredSshClient | null = null;
+    const scope = this.openTransferScope(name, options, debug);
     try {
-      connection = await this.pool.acquireSshClient(name, {
-        reuseConnection,
-        timeout: options?.timeout,
-        debug,
-        purpose: "sftp",
-      });
-      await this.sftpMkdirRecursive(connection.client, remoteDirectory, options?.timeout, debug);
-    } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(name, true);
-      }
-      throw error;
+      await scope.run(0, (_client, sftp) => this.sftpMkdirRecursive(sftp, remoteDirectory, options?.timeout, debug));
     } finally {
-      connection?.close();
+      await scope.close();
     }
   }
 
@@ -3810,6 +3892,27 @@ export class TransferService {
   }
 
   /**
+   * List one remote directory over an open SFTP session.
+   */
+  private sftpReaddir(
+    sftp: SFTPWrapper,
+    remotePath: string,
+  ): Promise<Array<{ filename: string; isDirectory: boolean; size: number }>> {
+    return new Promise((resolve, reject) => {
+      sftp.readdir(remotePath, (err, list) => {
+        if (err) {
+          return reject(this.makeSftpError("Failed to list remote directory", err));
+        }
+        resolve(list.map((entry) => ({
+          filename: entry.filename,
+          isDirectory: (entry.attrs.mode & 0o40000) !== 0,
+          size: entry.attrs.size,
+        })));
+      });
+    });
+  }
+
+  /**
    * List remote files/directories via SFTP readdir
    */
   public async listRemoteDir(
@@ -3818,42 +3921,15 @@ export class TransferService {
     options?: SftpOptions,
   ): Promise<Array<{ filename: string; isDirectory: boolean; size: number }>> {
     const resolvedName = name || this.pool.defaultName;
-    const reuseConnection = options?.reuseConnection !== false;
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
-    debug?.(`[mcp] sftp list on [${resolvedName}], reuseConnection=${reuseConnection}`);
-    let connection: AcquiredSshClient | null = null;
-
+    debug?.(`[mcp] sftp list on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
+    const scope = this.openTransferScope(resolvedName, options, debug);
     try {
-      connection = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection,
-        timeout: options?.timeout,
-        debug,
-        purpose: "sftp",
-      });
-      const entries = await new Promise<Array<{ filename: string; isDirectory: boolean; size: number }>>((resolve, reject) => {
-        this.openSftp(connection!.client, "list", options?.timeout, debug).then((sftp) => {
-          sftp.readdir(remotePath, (err, list) => {
-            sftp.end();
-            if (err) {
-              return reject(this.makeSftpError("Failed to list remote directory", err));
-            }
-            const entries = list.map((entry) => ({
-              filename: entry.filename,
-              isDirectory: (entry.attrs.mode & 0o40000) !== 0,
-              size: entry.attrs.size,
-            }));
-            resolve(entries);
-          });
-        }, reject);
-      });
-      return entries;
+      return await scope.run(0, (_client, sftp) => this.sftpReaddir(sftp, remotePath));
     } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(resolvedName, true);
-      }
       throw appendDebugToError(error as Error, debugCollector);
     } finally {
-      connection?.close();
+      await scope.close();
     }
   }
 
@@ -3861,6 +3937,7 @@ export class TransferService {
    * Upload a local directory recursively to a remote server. Directory
    * creation is completed before a bounded pool uploads independent files;
    * this avoids the per-file serial round-trip bottleneck for small trees.
+   * Each worker keeps one SFTP session for all the files it uploads.
    */
   public async uploadDirectory(
     localDir: string,
@@ -3876,82 +3953,60 @@ export class TransferService {
     }
     const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
 
-    const reuseConnection = options?.reuseConnection !== false;
     const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
-    debug?.(`[mcp] sftp recursive upload mkdir on [${resolvedName}], reuseConnection=${reuseConnection}`);
-    let connection: AcquiredSshClient | null = null;
+    debug?.(`[mcp] sftp recursive upload on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
+    // File errors already carry their own per-file debug block; only the
+    // setup phase (mkdir) reports through this call-level sink.
+    let setupDone = false;
     try {
-      connection = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection,
-        timeout: options?.timeout,
-        debug,
-        purpose: "sftp",
-      });
-      await this.sftpMkdirRecursive(connection.client, validatedRemoteDir, options?.timeout, debug);
+      await scope.run(0, (_client, sftp) => this.sftpMkdirRecursive(sftp, validatedRemoteDir, options?.timeout, debug));
+
+      const directories: string[] = [];
+      const files: Array<{ localPath: string; remotePath: string }> = [];
+      const collect = (currentLocal: string, currentRemote: string): void => {
+        for (const entry of fs.readdirSync(currentLocal, { withFileTypes: true })) {
+          const localPath = path.join(currentLocal, entry.name);
+          const remotePath = path.posix.join(currentRemote, entry.name);
+          if (entry.isDirectory()) {
+            directories.push(remotePath);
+            collect(localPath, remotePath);
+          } else {
+            files.push({ localPath, remotePath });
+          }
+        }
+      };
+      collect(resolvedLocal, validatedRemoteDir);
+
+      // Create the full directory tree on one session before the parallel
+      // file transfers start.
+      if (directories.length > 0) {
+        await scope.run(0, (_client, sftp) => this.sftpMkdirMany(sftp, directories, options?.timeout, debug));
+      }
+      setupDone = true;
+
+      await this.runBoundedTransfers(
+        files,
+        fileConcurrency,
+        async ({ localPath, remotePath }, worker) => {
+          await this.uploadFileInScope(scope, worker, resolvedName, localPath, remotePath, options);
+        },
+      );
+      return files.map(({ remotePath }) => remotePath);
     } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(resolvedName, true);
-      }
-      throw appendDebugToError(error as Error, debugCollector);
+      throw setupDone ? error : appendDebugToError(error as Error, debugCollector);
     } finally {
-      connection?.close();
+      await scope.close();
     }
-
-    const directories: string[] = [];
-    const files: Array<{ localPath: string; remotePath: string }> = [];
-    const collect = (currentLocal: string, currentRemote: string): void => {
-      for (const entry of fs.readdirSync(currentLocal, { withFileTypes: true })) {
-        const localPath = path.join(currentLocal, entry.name);
-        const remotePath = path.posix.join(currentRemote, entry.name);
-        if (entry.isDirectory()) {
-          directories.push(remotePath);
-          collect(localPath, remotePath);
-        } else {
-          files.push({ localPath, remotePath });
-        }
-      }
-    };
-    collect(resolvedLocal, validatedRemoteDir);
-
-    // Create the full directory tree through one SSH connection/SFTP channel
-    // before opening parallel file transfers.
-    if (directories.length > 0) {
-      let directoryConnection: AcquiredSshClient | null = null;
-      try {
-        directoryConnection = await this.pool.acquireSshClient(resolvedName, {
-          reuseConnection,
-          timeout: options?.timeout,
-          debug,
-          purpose: "sftp",
-        });
-        await this.sftpMkdirMany(directoryConnection.client, directories, options?.timeout, debug);
-      } catch (error) {
-        if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-          this.pool.closeClient(resolvedName, true);
-        }
-        throw appendDebugToError(error as Error, debugCollector);
-      } finally {
-        directoryConnection?.close();
-      }
-    }
-
-    await this.runBoundedTransfers(
-      files,
-      fileConcurrency,
-      async ({ localPath, remotePath }) => {
-        await this.upload(localPath, remotePath, resolvedName, options);
-      },
-    );
-    return files.map(({ remotePath }) => remotePath);
   }
 
   /**
    * PLAN.MD §5.7: upload multiple independent local files to the same remote
    * directory in one call. Each source lands at `remoteDir/<basename>`. This
-   * is uploadDirectory() minus the local directory walk -- every file still
-   * goes through the existing single-file upload() path so skip-if-identical,
-   * CRLF fix, fast, and local/remote path policy are all inherited rather
-   * than reimplemented, via a bounded worker pool that (unlike
+   * is uploadDirectory() minus the local directory walk -- every file goes
+   * through the same per-file core (uploadFileOn) so skip-if-identical, CRLF
+   * fix, fast, and local/remote path policy are all inherited rather than
+   * reimplemented, via a bounded worker pool that (unlike
    * runBoundedTransfers) reports a status for every file instead of throwing
    * on the first failure.
    */
@@ -3971,85 +4026,77 @@ export class TransferService {
     const validatedRemoteDir = this.validateRemotePath(remoteDir, resolvedName);
     const onError: BatchUploadOnError = options?.onError === "continue" ? "continue" : "abort";
     const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
-    const reuseConnection = options?.reuseConnection !== false;
+    const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
 
-    // Ensure the destination directory exists, mirroring uploadDirectory's
-    // mkdir step. This is unconditional remote I/O and intentionally happens
-    // after -- never before -- the pure validation above.
-    let connection: AcquiredSshClient | null = null;
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
     try {
-      connection = await this.pool.acquireSshClient(resolvedName, {
-        reuseConnection,
-        timeout: options?.timeout,
-        purpose: "sftp",
-      });
-      await this.sftpMkdirRecursive(connection.client, validatedRemoteDir, options?.timeout);
-    } catch (error) {
-      if (reuseConnection && this.pool.isConnectionError(error as Error)) {
-        this.pool.closeClient(resolvedName, true);
+      // Ensure the destination directory exists, mirroring uploadDirectory's
+      // mkdir step. This is unconditional remote I/O and intentionally happens
+      // after -- never before -- the pure validation above.
+      try {
+        await scope.run(0, (_client, sftp) => this.sftpMkdirRecursive(sftp, validatedRemoteDir, options?.timeout, debug));
+      } catch (error) {
+        throw appendDebugToError(error as Error, debugCollector);
       }
-      throw error;
-    } finally {
-      connection?.close();
-    }
 
-    const items = localPaths.map((localPath) => ({
-      localPath,
-      remotePath: path.posix.join(validatedRemoteDir, batchUploadBasename(localPath)),
-    }));
+      const items = localPaths.map((localPath) => ({
+        localPath,
+        remotePath: path.posix.join(validatedRemoteDir, batchUploadBasename(localPath)),
+      }));
 
-    const outcomes = await this.runBoundedTransfersWithResults(
-      items,
-      fileConcurrency,
-      onError,
-      ({ localPath, remotePath }) => this.upload(localPath, remotePath, resolvedName, options),
-    );
+      const outcomes = await this.runBoundedTransfersWithResults(
+        items,
+        fileConcurrency,
+        onError,
+        ({ localPath, remotePath }, worker) =>
+          this.uploadFileInScope(scope, worker, resolvedName, localPath, remotePath, options),
+      );
 
-    const results: BatchUploadFileResult[] = items.map(({ localPath, remotePath }, index) => {
-      const outcome = outcomes[index];
-      if (outcome.status === "done") {
-        if (outcome.value.startsWith(TransferService.UPLOAD_SKIPPED_PREFIX)) {
-          return { localPath, remotePath, status: "skipped" };
+      const results: BatchUploadFileResult[] = items.map(({ localPath, remotePath }, index) => {
+        const outcome = outcomes[index];
+        if (outcome.status === "done") {
+          if (outcome.value.startsWith(TransferService.UPLOAD_SKIPPED_PREFIX)) {
+            return { localPath, remotePath, status: "skipped" };
+          }
+          return {
+            localPath,
+            remotePath,
+            status: "uploaded",
+            crlfFixed: outcome.value.includes(TransferService.CRLF_FIX_MARKER),
+          };
+        }
+        if (outcome.status === "failed") {
+          const error = outcome.error;
+          return { localPath, remotePath, status: "failed", reason: error instanceof Error ? error.message : String(error) };
         }
         return {
           localPath,
           remotePath,
-          status: "uploaded",
-          crlfFixed: outcome.value.includes(TransferService.CRLF_FIX_MARKER),
+          status: "failed",
+          reason: `not attempted: aborted after an earlier failure (onError=${onError})`,
         };
-      }
-      if (outcome.status === "failed") {
-        const error = outcome.error;
-        return { localPath, remotePath, status: "failed", reason: error instanceof Error ? error.message : String(error) };
-      }
-      return {
-        localPath,
-        remotePath,
-        status: "failed",
-        reason: `not attempted: aborted after an earlier failure (onError=${onError})`,
-      };
-    });
+      });
 
-    return {
-      results,
-      total: results.length,
-      uploadedCount: results.filter((result) => result.status === "uploaded").length,
-      skippedCount: results.filter((result) => result.status === "skipped").length,
-      failedCount: results.filter((result) => result.status === "failed").length,
-      crlfFixedCount: results.filter((result) => result.crlfFixed).length,
-    };
+      return {
+        results,
+        total: results.length,
+        uploadedCount: results.filter((result) => result.status === "uploaded").length,
+        skippedCount: results.filter((result) => result.status === "skipped").length,
+        failedCount: results.filter((result) => result.status === "failed").length,
+        crlfFixedCount: results.filter((result) => result.crlfFixed).length,
+      };
+    } finally {
+      await scope.close();
+    }
   }
 
   /**
    * PLAN.MD P1-03 (walker slice, §2.3 F5): concurrently discover a remote
    * directory tree with bounded `readdir` concurrency, instead of the old
    * fully-serial `await listRemoteDir` per directory. A semaphore gates only
-   * the `list()` call itself -- the one point per directory where
-   * `listRemoteDir` opens its own SFTP channel (see `openSftp` inside it) --
-   * so at most `concurrency` directory listings are ever in flight at once,
-   * consistent with `resolveRecursiveFileConcurrency`'s reasoning about
-   * OpenSSH's default `MaxSessions`. Everything else (looping entries, local
-   * `mkdir`, recursing into subdirectories) is local and unbounded.
+   * the `list()` call itself, so at most `concurrency` directory listings are
+   * ever in flight at once. Everything else (looping entries, local `mkdir`,
+   * recursing into subdirectories) is local and unbounded.
    *
    * Every discovered directory gets `fs.mkdirSync` called for it as soon as
    * it is discovered (before its own contents are listed), matching the old
@@ -4090,13 +4137,6 @@ export class TransferService {
     const visit = async (remote: string, local: string, node: RemoteDirNode): Promise<void> => {
       if (firstError !== undefined) return;
       await acquire();
-      // Re-check after acquiring: this visit may have been queued behind the
-      // semaphore for a long time, and a sibling may have failed while it
-      // waited. Without this, every already-queued directory still issues its
-      // own doomed listing before the error surfaces -- on a wide tree
-      // (thousands of subdirectories discovered but not yet listed) that is
-      // thousands of pointless SFTP round trips between the failure and the
-      // caller seeing it.
       // Re-check after acquiring: this visit may have been queued behind the
       // semaphore for a long time, and a sibling may have failed while it
       // waited. Without this, every already-queued directory still issues its
@@ -4150,11 +4190,11 @@ export class TransferService {
   /**
    * Download a remote directory recursively to a local path. First discover
    * the remote tree and create the local directory tree (bounded-concurrent
-   * `readdir`, see `walkRemoteDirectory`), then pull independent files
-   * through a bounded worker pool to amortize small-file SFTP round trips.
-   * Discovery fully completes before any file transfer starts, so the two
-   * phases never both hold SFTP channels at once -- both are bounded by the
-   * same `fileConcurrency`, so the combined channel usage never exceeds it.
+   * `readdir` over ONE shared session, see `walkRemoteDirectory`), then pull
+   * the files through the same bounded worker pool every multi-file download
+   * uses (`downloadPairs`). Discovery completes before any file transfer
+   * starts, and the listing session is worker 0's session, so the whole call
+   * never holds more than min(`fileConcurrency`, 4) SFTP channels.
    */
   public async downloadDirectory(
     remoteDir: string,
@@ -4171,34 +4211,102 @@ export class TransferService {
       fs.mkdirSync(resolvedLocal, { recursive: true });
     }
 
-    const tree = await this.walkRemoteDirectory(
-      validatedRemoteDir,
-      resolvedLocal,
-      fileConcurrency,
-      (currentRemote) => this.listRemoteDir(currentRemote, resolvedName, options),
-    );
-    const files = flattenRemoteDirTree(tree);
+    const { collector: debugCollector, debug } = createDebugCollector(options?.vvv === true);
+    debug?.(`[mcp] sftp recursive download on [${resolvedName}], reuseConnection=${options?.reuseConnection !== false}`);
+    const scope = this.openTransferScope(resolvedName, options, debug, this.sftpSessionsFor(fileConcurrency));
+    // File errors already carry their own per-file debug block; only the
+    // discovery phase reports through this call-level sink.
+    let discovered = false;
+    try {
+      const tree = await scope.run(0, (_client, sftp) =>
+        this.walkRemoteDirectory(validatedRemoteDir, resolvedLocal, fileConcurrency, (currentRemote) =>
+          this.sftpReaddir(sftp, currentRemote)));
+      const files = flattenRemoteDirTree(tree);
+      discovered = true;
 
-    await this.runBoundedTransfers(
-      files,
-      fileConcurrency,
-      async ({ remotePath, localPath }) => {
-        await this.download(remotePath, localPath, resolvedName, options);
-      },
-    );
-    return files.map(({ localPath }) => localPath);
+      const outcomes = await this.downloadPairs(scope, resolvedName, files, fileConcurrency, options);
+      for (const outcome of outcomes) {
+        if (outcome.status === "failed") throw outcome.error;
+      }
+      return files.map(({ localPath }) => localPath);
+    } catch (error) {
+      throw discovered ? error : appendDebugToError(error as Error, debugCollector);
+    } finally {
+      await scope.close();
+    }
   }
 
   /**
-   * Create remote directory recursively via SFTP
+   * Download independent files through the bounded worker pool, each worker
+   * on its own reused SFTP session. onError="abort": once a file fails no
+   * unstarted file is scheduled, files already in flight finish, and every
+   * file gets a recorded outcome -- so a caller can report exactly what was
+   * pulled.
+   */
+  private downloadPairs(
+    scope: TransferScope,
+    resolvedName: string,
+    pairs: ReadonlyArray<{ remotePath: string; localPath: string }>,
+    concurrency: number,
+    options: SftpOptions | undefined,
+  ): Promise<Array<BatchTransferOutcome<string>>> {
+    return this.runBoundedTransfersWithResults(pairs, concurrency, "abort", async ({ remotePath, localPath }, worker) => {
+      // One bounded debug sink per file, as a standalone download() has.
+      const { collector, debug } = createDebugCollector(options?.vvv === true);
+      try {
+        const validatedLocalPath = this.validateLocalPath(localPath, resolvedName);
+        const validatedRemotePath = this.validateRemotePath(remotePath, resolvedName);
+        const message = await scope.run(worker, (_client, sftp) =>
+          this.downloadFileOn(sftp, validatedRemotePath, validatedLocalPath, options, debug), debug);
+        return appendDebugOutput(message, collector);
+      } catch (error) {
+        throw appendDebugToError(error as Error, collector);
+      }
+    });
+  }
+
+  /**
+   * Download many independent files from one server with bounded concurrency
+   * (`fileConcurrency`, default 32) over a few shared SFTP sessions. Never throws
+   * for a failing file: every pair gets a status ("downloaded", "failed" with
+   * a reason, or "not-attempted" because an earlier file failed), so a caller
+   * such as workspace-run collect can report exactly what was already pulled.
+   */
+  public async downloadFiles(
+    pairs: ReadonlyArray<{ remotePath: string; localPath: string }>,
+    server: string,
+    options?: SftpOptions,
+  ): Promise<{ results: DownloadFileResult[] }> {
+    const resolvedName = server || this.pool.defaultName;
+    const fileConcurrency = this.resolveRecursiveFileConcurrency(options);
+    const scope = this.openTransferScope(resolvedName, options, undefined, this.sftpSessionsFor(fileConcurrency));
+    try {
+      const outcomes = await this.downloadPairs(scope, resolvedName, pairs, fileConcurrency, options);
+      return {
+        results: pairs.map(({ remotePath, localPath }, index): DownloadFileResult => {
+          const outcome = outcomes[index];
+          if (outcome.status === "done") return { remotePath, localPath, status: "downloaded" };
+          if (outcome.status === "failed") {
+            const error = outcome.error;
+            return { remotePath, localPath, status: "failed", reason: error instanceof Error ? error.message : String(error) };
+          }
+          return { remotePath, localPath, status: "not-attempted" };
+        }),
+      };
+    } finally {
+      await scope.close();
+    }
+  }
+
+  /**
+   * Create remote directory recursively over an open SFTP session.
    */
   private async sftpMkdirRecursive(
-    client: Client,
+    sftp: SFTPWrapper,
     remotePath: string,
     timeout?: number,
     debug?: SshDebugSink,
   ): Promise<void> {
-    const sftp = await this.openSftp(client, "mkdir", timeout, debug);
     const walk = new Promise<void>((resolve, reject) => {
       const parts = remotePath.split("/").filter(Boolean);
       let current = "";
@@ -4224,49 +4332,36 @@ export class TransferService {
       mkdirNext(0);
     });
 
-    try {
-      await this.pool.withConnectionTimeout(
-        walk,
-        this.pool.normalizeConnectTimeout(timeout),
-        `SFTP mkdir ${remotePath}`,
-        debug,
-      );
-    } finally {
-      try {
-        sftp.end();
-      } catch {
-        // Ignore late SFTP cleanup errors.
-      }
-    }
+    await this.pool.withConnectionTimeout(
+      walk,
+      this.pool.normalizeConnectTimeout(timeout),
+      `SFTP mkdir ${remotePath}`,
+      debug,
+    );
   }
 
-  /** Create already-parent-ordered directories through one SFTP channel. */
+  /** Create already-parent-ordered directories over an open SFTP session. */
   private async sftpMkdirMany(
-    client: Client,
+    sftp: SFTPWrapper,
     remoteDirectories: readonly string[],
     timeout?: number,
     debug?: SshDebugSink,
   ): Promise<void> {
-    const sftp = await this.openSftp(client, "mkdir-many", timeout, debug);
-    try {
-      for (const remoteDirectory of remoteDirectories) {
-        await this.pool.withConnectionTimeout(
-          new Promise<void>((resolve, reject) => {
-            sftp.mkdir(remoteDirectory, (error?: Error | null) => {
-              if (error && this.pool.isConnectionShapedMessage(error.message)) {
-                reject(this.makeSftpError(`Remote mkdir failed for '${remoteDirectory}'`, error));
-                return;
-              }
-              resolve();
-            });
-          }),
-          this.pool.normalizeConnectTimeout(timeout),
-          `SFTP mkdir ${remoteDirectory}`,
-          debug,
-        );
-      }
-    } finally {
-      try { sftp.end(); } catch { /* ignore late cleanup errors */ }
+    for (const remoteDirectory of remoteDirectories) {
+      await this.pool.withConnectionTimeout(
+        new Promise<void>((resolve, reject) => {
+          sftp.mkdir(remoteDirectory, (error?: Error | null) => {
+            if (error && this.pool.isConnectionShapedMessage(error.message)) {
+              reject(this.makeSftpError(`Remote mkdir failed for '${remoteDirectory}'`, error));
+              return;
+            }
+            resolve();
+          });
+        }),
+        this.pool.normalizeConnectTimeout(timeout),
+        `SFTP mkdir ${remoteDirectory}`,
+        debug,
+      );
     }
   }
 }

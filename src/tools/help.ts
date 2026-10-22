@@ -20,7 +20,14 @@ Example:
   list-servers { verbose: true }    → include cached status if available
   list-servers { refresh: true }    → fresh system status (bounded)`,
 
-  "execute-command": `execute-command — Run a shell command on a remote server.
+  "execute-command": `execute-command — Run a command in the remote default shell.
+
+cmdString is sent unchanged; no cmd/pwsh/sh prefix is required unless you
+need a different interpreter. Each call has separate shell state: cd and
+export do not persist through connection reuse. stream selects background
+return versus waiting, not streaming inside this tool call. Background
+status is process-local and is lost on MCP restart; logPath remains local.
+Use workspace-run for tasks that must survive disconnects/restarts.
 
 Parameters:
   cmdString       (string, required)   The shell command to execute.
@@ -37,18 +44,21 @@ Parameters:
                   when you need fresh handshake logs.
   timeout         (number, optional)   Per-attempt phase timeout in ms:
                                       SSH setup, exec-channel open, and
-                                      remote command execution each use this
-                                      cap.
+                                      remote command execution use this cap.
+                                      Channel opening is also bounded by
+                                      configured channelOpenTimeout.
                   Defaults: 300000 (stream) / 30000 (non-stream).
+  maxOutputBytes  (number, optional)   Returned tail limit per stdout/stderr,
+                  default 65536 bytes. Full output is saved locally.
 
 connectionName rule:
   • If only one server is enabled → optional (auto-selected).
   • If multiple servers are enabled → REQUIRED.
 
 Examples:
-  execute-command { cmdString: "pwd" }
+  execute-command { cmdString: "pwd", connectionName: "dev", stream: false }
   execute-command { cmdString: "docker ps -a", connectionName: "prod", stream: false }
-  execute-command { cmdString: "tail -f /var/log/syslog", stream: true, timeout: 600000 }
+  execute-command { cmdString: "tail -f /var/log/syslog", connectionName: "dev", stream: true, timeout: 600000 }
   command-status { runId: "cmd_20260712T120000Z_ab12cd34" }
   execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false }
   execute-command { cmdString: "hostname", connectionName: "scnet", stream: false, reuseConnection: false, vvv: true }`,
@@ -113,31 +123,41 @@ Examples:
 
 Parameters:
   localPath       (string | string[], required)  File path on the MCP host,
-                  or an array of paths for batch upload. Must be inside the
-                  MCP working directory.
+                  or an array of paths for batch upload. Restricted to the
+                  MCP working directory/allowedLocalDirectories unless
+                  disableSftpPathPolicy is enabled.
   remotePath      (string, required)   Destination path on the remote server.
                   Batch mode (array localPath): this must be a directory;
                   each source lands at remotePath/<basename>.
   connectionName  (string, see below)  Target server name from list-servers.
-  skipIfIdentical (boolean, optional)  Default true. Skip when remote matches.
+  skipIfIdentical (boolean, optional)  Default true. Skip only when the remote
+                  file has the same size and the same MD5 as the bytes that
+                  would be written (after the shell-script CRLF->LF fix). The
+                  MD5 is computed on the server (md5sum, md5 -r or rclone
+                  md5sum, verified with empty input once per server); with no
+                  such command the file is uploaded, never read back to compare.
+                  Local CRLF + remote LF: skipped. Remote CRLF + local LF:
+                  re-uploaded as LF.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
                   or suspected stale cached SSH connection.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
                   Recursive success returns structured JSON; debug is surfaced
                   for single-file results, relay results, and recursive errors.
-  fast            (boolean, optional)  Default false. Use ssh2 fastPut for
+  fast            (boolean, optional)  Default true. Use ssh2 fastPut for
                   single-file upload throughput. Not multi-file concurrency.
+                  false is a serial compatibility mode and is much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. SFTP chunk bytes.
   onError         (string, optional)   Batch mode only. "abort" (default): stop
                   scheduling new files once one fails, drain in-flight ones.
                   "continue": attempt every file regardless of earlier failures.
                   Both report a per-file uploaded/skipped/failed status.
-  fileConcurrency (number, optional)   Batch mode only. Independent files
-                  uploaded in parallel. Default 4, maximum 8.
+  fileConcurrency (number, optional)   Batch mode only. Files in flight at
+                  once. Default 32, maximum 64. They share at most 4 SFTP
+                  channels.
   connections     (number, optional)   Single file only (not batch). Default 1
-                  (unchanged behavior). Above 1, write the file over that many
+                  (default behavior). Above 1, write the file over that many
                   INDEPENDENT SSH/TCP connections, each carrying its own
                   non-overlapping byte range into one remote temp file that
                   then replaces remotePath -- atomically where the server
@@ -166,7 +186,7 @@ Batch mode (array localPath):
   • Returns structured JSON: { results: [...], total, uploadedCount,
     skippedCount, failedCount, crlfFixedCount }. A single string localPath
     keeps the original plain-text response, unchanged.
-  • archive is not available for batch mode in this delivery round.
+  • archive is not available for batch mode currently.
 
 Example:
   upload { localPath: "data.csv", remotePath: "/tmp/data.csv" }
@@ -180,17 +200,19 @@ Example:
 Parameters:
   remotePath      (string, required)   File path on the remote server.
   localPath       (string, required)   Destination on the MCP host.
-                  Must be inside the MCP working directory.
+                  Restricted to the MCP working directory/allowedLocalDirectories
+                  unless disableSftpPathPolicy is enabled.
   connectionName  (string, see below)  Target server name from list-servers.
   reuseConnection (boolean, optional)  Default true. Set false after timeout
                   or suspected stale cached SSH connection.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast            (boolean, optional)  Default false. Use ssh2 fastGet for
+  fast            (boolean, optional)  Default true. Use ssh2 fastGet for
                   single-file download throughput. Not multi-file concurrency.
+                  false is a serial compatibility mode and is much slower.
   sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
   chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
-  connections     (number, optional)   Default 1 (unchanged behavior). Above 1,
+  connections     (number, optional)   Default 1 (default behavior). Above 1,
                   split the file into that many non-overlapping byte ranges and
                   pull each over its OWN independent SSH/TCP connection, then
                   reassemble, verify and atomically rename. Maximum 8.
@@ -232,6 +254,11 @@ Modes:
             non-interactive SSH trust (never transfers a private key, never
             auto-accepts an unknown host key). strategy="auto" uses direct
             when possible, else falls back to relay and reports why.
+            Same server on both ends (relay/auto): when its SFTP server
+            advertises copy-data (OpenSSH 9.0+), the server copies the file
+            itself into a temp file next to the target (size + md5 verified,
+            then renamed into place), no bytes pass through this MCP host and
+            connections is ignored; otherwise the normal relay runs.
 
 Parameters for upload / download:
   mode            (string, required)   "upload" or "download"
@@ -243,9 +270,11 @@ Parameters for upload / download:
   recursive       (boolean, optional)  True to transfer a whole directory tree.
                   Not combinable with an array localPath.
   skipIfIdentical (boolean, optional)  Default true. Skip the transfer when the
-                  destination already matches the source. Upload: byte-compare
-                  for files <= 256 MiB, MD5 otherwise; shell scripts
-                  (.sh/.bash/.zsh) ignore CRLF<->LF differences. Relay: size +
+                  destination already matches the source. Upload: remote MD5
+                  (computed on the server, no content crosses the network) must
+                  equal the MD5 of the bytes to be written, i.e. after the
+                  .sh/.bash/.zsh CRLF->LF fix; no remote md5sum/md5 -r/rclone
+                  md5sum means upload. Relay: size +
                   md5sum on both servers when available, falling back to
                   transferring. Download is never skipped. Set false to force.
   archiveCompression (string, optional) Only with archive=true. One of "none"
@@ -254,11 +283,15 @@ Parameters for upload / download:
   reuseConnection (boolean, optional)  Default true. Set false after timeout.
   timeout         (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv             (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast            (boolean, optional)  Default false. upload/download only:
-                  use ssh2 fastPut/fastGet for each single file. Directory
-                  recursion stays sequential; no multi-file concurrency.
-  sftpConcurrency (number, optional)   Only with fast=true. Concurrent SFTP chunks.
-  chunkSize       (number, optional)   Only with fast=true. Bytes per SFTP request.
+  fast            (boolean, optional)  Default true. upload/download only:
+                  use ssh2 fastPut/fastGet for each file. Independent files
+                  are scheduled in parallel using fileConcurrency over a few
+                  shared SFTP sessions. false is a serial compatibility
+                  mode and is much slower.
+  sftpConcurrency (number, optional)   Upload/download with fast=true: concurrent
+                  SFTP chunks. Relay: prefetched source chunks, default 64.
+  chunkSize       (number, optional)   Bytes per chunk. Relay default 32768;
+                  total prefetch window is capped at 64 MiB.
   connections     (number, optional)   Single file only; relay only with
                   strategy="relay" (the default). Default 1 (unchanged).
                   Above 1, split the file into that many non-overlapping byte
@@ -280,11 +313,11 @@ Parameters for upload / download:
                   Rejected for relay strategy="direct"/"auto", a batch
                   (array) localPath, recursive=true and archive=true.
   fileConcurrency (number, optional)   Recursive or batch upload only: independent
-                  files transferred in parallel. Default 4, maximum 8. Each
-                  parallel file opens its own SFTP channel on the same SSH
-                  connection; capped under OpenSSH's common default
-                  MaxSessions=10 so it does not reliably fail channel-open
-                  against a default-configured remote.
+                  files in flight at once. Default 32, maximum 64. The
+                  files share at most min(fileConcurrency, 4) SFTP channels
+                  on the same SSH connection (requests are multiplexed on a
+                  channel), so the count stays well under OpenSSH's common
+                  default MaxSessions=10 however many files are in flight.
   onError         (string, optional)   Batch upload only (array localPath).
                   "abort" (default): stop scheduling new files once one fails,
                   drain in-flight ones. "continue": attempt every file
@@ -302,11 +335,12 @@ Batch upload (mode="upload" with an array localPath):
   • Returns structured JSON: { results: [...], total, uploadedCount,
     skippedCount, failedCount, crlfFixedCount }. A single string localPath
     keeps the original plain-text response, unchanged.
-  • Not combinable with archive=true or recursive=true in this delivery round.
-  • download/relay do not support an array localPath in this delivery round.
+  • Not combinable with archive=true or recursive=true currently.
+  • download/relay do not support an array localPath currently.
 
 Parameters for relay:
-  mode              (string, required)   "relay"
+  mode              (string, required)   "relay" selects remote-to-remote;
+                    strategy selects how bytes move.
   sourceServer      (string, required)   Server name to read from.
   sourceRemotePath  (string, required)   File path on source server.
   destServer        (string, required)   Server name to write to.
@@ -314,11 +348,12 @@ Parameters for relay:
   reuseConnection   (boolean, optional)  Default true. Set false after timeout.
   timeout           (number, optional)   SSH setup and SFTP channel-open timeout.
   vvv               (boolean, optional)  Default false. Append bounded SSH/SFTP debug.
-  fast              (boolean, optional)  Accepted but relay keeps the streaming
-                    SFTP pipe path; fastGet/fastPut apply to host<->remote only.
+  fast              (boolean, optional)  Ignored for relay, which uses bounded
+                    parallel SFTP read-ahead; fastGet/fastPut apply to
+                    host<->remote only.
   strategy          (string, optional)   "relay" (default) | "direct" | "auto".
                     "direct": run the copy on the source server (rsync, else
-                    tar|ssh; never rclone) so this MCP host relays zero
+                    tar|ssh; uses available backend) so this MCP host relays zero
                     file-data bytes; fails explicitly with the precise reason
                     if not possible (source cannot reach the destination
                     directly, destination host key not pinned on the source,
@@ -336,13 +371,17 @@ connectionName rule (upload/download):
 Examples:
   transfer { mode: "upload", localPath: "dist/", remotePath: "/opt/app/dist", recursive: true }
   transfer { mode: "upload", localPath: ["a/config.yaml", "b/settings.json"], remotePath: "/etc/app" }
-  transfer { mode: "download", localPath: "huge.bin", remotePath: "/data/huge.bin",
+  transfer { mode: "download", connectionName: "prod", localPath: "huge.bin",
+             remotePath: "/data/huge.bin", connections: 4 }
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/var/log/app.log",
              destServer: "backup", destRemotePath: "/backup/app.log" }
   transfer { mode: "relay", sourceServer: "prod", sourceRemotePath: "/data/dump.tar",
              destServer: "backup", destRemotePath: "/backup/dump.tar", strategy: "auto" }`,
 
-  "workspace-run": `workspace-run — Launch an entrypoint on a remote server, durably. No YAML config required.
+  "workspace-run": `workspace-run — Start a durable task on a Linux remote.
+
+Requires a Linux remote with bash, setsid and /proc, plus the selected
+interpreter and an enabled SSH server. No YAML run profile is required.
 
 The launched process survives SSH disconnect and MCP adapter restart: all
 state (meta.json/stdout.log/stderr.log/pid/heartbeat/exit.json) lives under
@@ -351,7 +390,7 @@ local cache of run state — status/logs/cancel require the remote server to
 be reachable.
 
 Two ways to describe a run; a saved profile is a preset, NOT a prerequisite:
-  • Inline (zero config, works with servers from ~/.ssh/config):
+  • Inline (no saved run profile; SSH server configuration is still needed):
       remoteRoot + one of venv / executable
   • Saved: profile: "<name>" — a runProfiles.<name> entry in YAML. Worth
     configuring when you launch the same job repeatedly, or when you want to
@@ -359,14 +398,14 @@ Two ways to describe a run; a saved profile is a preset, NOT a prerequisite:
     overridden. Inline runs allow any safe relative entrypoint under
     remoteRoot ('..', absolute paths and drive letters are still rejected).
 
-Full pipeline (PLAN.MD Phase 2): [push] → preflight → launching →
+Full pipeline: [push] → preflight → launching →
 remote-running → [collect].
   • push uploads the push sources to remoteRoot before launch — batch upload
     for individual files, recursive upload for directories, both
     skip-if-identical. Sources are runProfiles.<name>.push.paths for a saved
-    profile, or pushPaths inline. It defaults to true for a profile that
-    declares push.paths (or its defaultPush) and to false for an inline run
-    with no pushPaths, since remoteRoot is assumed to already hold the code.
+    profile, or pushPaths inline. Saved profiles use defaultPush when set,
+    otherwise true; enabled push requires push.paths. Inline runs default
+    to false without pushPaths, since the code is assumed to be remote.
     Pass push:false to skip it explicitly.
   • collect (default the profile's collect.paths) pulls artifacts back by
     explicit glob (relative to remoteRoot) after the run finishes, into
@@ -383,7 +422,7 @@ remote-running → [collect].
     material); a collect failure never rewrites the run's own exit code —
     it is reported separately in details.collect.
   • sync only accepts "none"/omitted; "flush" returns SYNC_NOT_AVAILABLE
-    (Phase 3).
+    (not supported).
   • Only environment.type venv/executable is supported (inline venv/
     executable always is); a saved profile using conda/module/slurm or
     gpu.required/secretEnv returns a *_NOT_AVAILABLE error.
@@ -417,8 +456,9 @@ Parameters:
   server          (string, optional)   With a profile, defaults to the
                   profile's configured server. Inline, the server to run on
                   — omittable only when exactly one server is enabled.
-  push            (boolean, optional)  Default true for a profile with
-                  push.paths, false for an inline run without pushPaths.
+  push            (boolean, optional)  Profiles use defaultPush when set,
+                  otherwise true (sources required);
+                  false for an inline run without pushPaths.
                   See above.
   collect         (string[], optional) Default the profile's collect.paths.
                   See above.
@@ -437,7 +477,7 @@ Returns: { ok, jobId, state, message, next, details } — jobId equals the
 returned runId. details.status is the same shape run-status returns.
 details.collect (when collect ran) is { status, reason?, files, totalBytes }.
 
-Example (inline — nothing configured anywhere):
+Example (inline — server configured, no saved run profile):
   workspace-run { server: "gpu-box", remoteRoot: "/data/proj",
                   venv: "/data/envs/proj", entrypoint: "train.py",
                   args: ["--epochs", "3"] }
@@ -479,7 +519,7 @@ failed, cancelled, recovering (heartbeat stale/missing — ambiguous until
 confirmed), orphaned.
 
 Example:
-  run-status { runId: "run_20260915T120000Z_ab12cd34" }`,
+  run-status { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }`,
 
   "run-logs": `run-logs — Read a byte-offset window of a run's stdout/stderr.
 
@@ -508,8 +548,8 @@ Returns: { ok, jobId, state, message, details } where details is
 Poll again with offset=nextOffset while hasMore=true.
 
 Example:
-  run-logs { runId: "run_20260915T120000Z_ab12cd34", offset: 0 }
-  run-logs { runId: "run_20260915T120000Z_ab12cd34", stream: "stderr" }`,
+  run-logs { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", offset: 0 }
+  run-logs { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", stream: "stderr" }`,
 
   "run-list": `run-list — List workspace-run runs on a server, newest first.
 
@@ -539,8 +579,8 @@ Returns: { ok, jobId: "run-list", state: "completed", message, details }
 where details.runs is an array of the same shape run-status returns.
 
 Example:
-  run-list { profile: "qwen-dev", state: "running" }
-  run-list { profile: "(ad-hoc)" }`,
+  run-list { connectionName: "gpu-box", profile: "qwen-dev", state: "running" }
+  run-list { connectionName: "gpu-box", profile: "(ad-hoc)" }`,
 
   "run-cancel": `run-cancel — Cancel a workspace-run.
 
@@ -573,8 +613,8 @@ already-exited, orphaned. state is "cancelling" for terminated/killed
 the run's real final state for already-exited.
 
 Example:
-  run-cancel { runId: "run_20260915T120000Z_ab12cd34" }
-  run-cancel { runId: "run_20260915T120000Z_ab12cd34", graceMs: 10000 }`,
+  run-cancel { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }
+  run-cancel { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", graceMs: 10000 }`,
 
   "run-retry": `run-retry — Launch a fresh run from an earlier run's stored config snapshot.
 
@@ -585,15 +625,14 @@ change what actually gets retried. Creates a brand-new runId recording
 parentRunId; the original run is untouched and still independently
 queryable. Requires the original run to have been launched by a build that
 recorded a config snapshot — RETRY_SNAPSHOT_UNAVAILABLE otherwise. Returns
-SECRET_REQUIRED if the snapshot declares secretEnv (not re-resolvable this
-delivery round).
+SECRET_REQUIRED if the snapshot declares secretEnv (not re-resolvable currently).
 
 Parameters:
   runId           (string, required)   runId of the run to retry.
   connectionName  (string, see below)  Server the original run was launched
                   on.
   push            (boolean, optional)  Default the snapshot's own default:
-                  true for a profile-backed run that declared push.paths,
+                  profile.defaultPush if set, otherwise true for a saved profile;
                   FALSE for a run launched inline without pushPaths (it
                   never pushed, so its retry does not either). Pass true to
                   force a re-push — only meaningful if the snapshot has push
@@ -611,8 +650,8 @@ Returns: { ok, jobId, state, message, next, details } — jobId is the NEW
 runId. details.parentRunId is the original runId.
 
 Example:
-  run-retry { runId: "run_20260915T120000Z_ab12cd34" }
-  run-retry { runId: "run_20260915T120000Z_ab12cd34", push: false }`,
+  run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box" }
+  run-retry { runId: "run_20260915T120000Z_ab12cd34", connectionName: "gpu-box", push: false }`,
 
   "help": `help — Show detailed usage for one or all tools.
 
@@ -629,13 +668,13 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
 
   list-servers      Discover available SSH servers and their status.
   execute-command   Run a shell command on a remote server.
-  show-whitelist    Show the active command policy.
+  show-whitelist    Show full command/SFTP policy (legacy name; includes blacklist).
   close-connection  Close a cached SSH connection for a server.
   command-status    Poll background status and incremental live output.
   upload            Upload a single file, or a batch of files, to a remote server.
   download          Download a single file from a remote server.
-  transfer          Move files: single, recursive, batch upload, or cross-server relay.
-  workspace-run     Launch an entrypoint on a remote server -- no YAML config needed (remoteRoot + venv/executable inline, or a saved runProfiles.<name> preset). [push] -> preflight -> launching -> remote-running -> [collect].
+  transfer          Move files/directories; mode=relay selects remote-to-remote, strategy selects relay/direct/auto.
+  workspace-run     Start a durable Linux task; no YAML run profile needed. Pass remoteRoot + venv/executable inline, or use a saved profile. Optional push/collect.
   run-status        Query a workspace-run's current status by runId.
   run-logs          Read a byte-offset window of a run's stdout/stderr.
   run-list          List runs on a server, newest first.
@@ -646,7 +685,7 @@ const TOOL_OVERVIEW = `Available tools (use help { tool: "<name>" } for details)
 Quick start:
   1. list-servers → discover server names
   2. show-whitelist { connectionName: "<name>" } → inspect command policy
-  3. execute-command { cmdString: "pwd", connectionName: "<name>" }
+  3. execute-command { cmdString: "pwd", connectionName: "<name>", stream: false }
   4. command-status { runId: "<runId>" } → poll stream=true background commands
   5. close-connection { connectionName: "<name>" } → drop a stale cached SSH client`;
 
@@ -669,7 +708,7 @@ export const TOOL_OVERVIEW_FOR_TEST: string = TOOL_OVERVIEW;
 export function registerHelpTool(server: McpServer): void {
   server.tool(
     "help",
-    "Show detailed usage instructions for one or all tools. Call with no arguments for an overview, or specify a tool name for full parameter docs and examples.",
+    "Show a tool overview, or full parameter docs and examples for the selected tool.",
     {
       tool: z.string().optional().describe("Tool name to get detailed help for. Omit to see an overview of all tools."),
     },

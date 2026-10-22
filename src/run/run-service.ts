@@ -653,7 +653,7 @@ export class RunService {
    * PLAN.MD P2-06/§5.8: pull collect.paths glob matches back from remoteRoot
    * into the profile's collect.localDir, enforcing the byte/file caps with
    * no silent truncation (stop and report exactly what was already pulled).
-   * Reuses TransferService's single-file download() per matched file (§5.8:
+   * Pulls the matched files with TransferService.downloadFiles (§5.8:
    * "拉取走 Phase 1 TransferService") -- no new transfer/streaming logic.
    * Never throws: a failure is reported as CollectPhaseResult.status
    * "failed" with the partial file list, so it can never be mistaken for
@@ -681,21 +681,32 @@ export class RunService {
     }
 
     const selection = selectWithinCollectCaps(matches, maxBytes, maxFiles);
-    const pulled: CollectFileResult[] = [];
-    for (const match of selection.accepted) {
-      const localPath = path.join(localDir, ...match.relativePath.split("/"));
+    const pairs = selection.accepted.map((match) => ({
+      remotePath: match.absolutePath,
+      localPath: path.join(localDir, ...match.relativePath.split("/")),
+    }));
+    for (const { localPath } of pairs) {
       fs.mkdirSync(path.dirname(localPath), { recursive: true });
-      try {
-        await this.sshManager.download(match.absolutePath, localPath, server, { reuseConnection });
-      } catch (error) {
-        return {
-          status: "failed",
-          reason: `download failed for '${match.relativePath}': ${(error as Error).message}. Already pulled ${pulled.length} file(s) before this failure.`,
-          files: pulled,
-          totalBytes: pulled.reduce((sum, f) => sum + f.bytes, 0),
-        };
+    }
+    // Bounded-concurrency download over reused SFTP sessions. Every file gets
+    // its own outcome, so on a failure the "already pulled" list is exactly
+    // the files that really completed (with concurrency that is not simply
+    // "everything before the failing one").
+    const { results } = await this.sshManager.getTransferService().downloadFiles(pairs, server, { reuseConnection });
+    const pulled: CollectFileResult[] = [];
+    results.forEach((result, index) => {
+      if (result.status === "downloaded") {
+        pulled.push({ remotePath: result.remotePath, localPath: result.localPath, bytes: selection.accepted[index].bytes });
       }
-      pulled.push({ remotePath: match.absolutePath, localPath, bytes: match.bytes });
+    });
+    const firstFailure = results.findIndex((result) => result.status === "failed");
+    if (firstFailure !== -1) {
+      return {
+        status: "failed",
+        reason: `download failed for '${selection.accepted[firstFailure].relativePath}': ${results[firstFailure].reason}. Already pulled ${pulled.length} file(s) before this failure.`,
+        files: pulled,
+        totalBytes: pulled.reduce((sum, f) => sum + f.bytes, 0),
+      };
     }
 
     if (selection.exceeded) {

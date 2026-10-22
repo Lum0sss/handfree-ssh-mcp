@@ -16,12 +16,12 @@ export function registerRunRetryTool(server: McpServer): void {
 
   server.tool(
     "run-retry",
-    "Launch a fresh run from an earlier workspace-run's stored config snapshot (profile, entrypoint, args, env, push/collect settings) rather than the live runProfiles config -- so a config hot-reload or a since-deleted profile cannot change what gets retried. Returns a NEW runId recording parentRunId; the original run is untouched. Requires the original run to have been launched by a build that recorded a config snapshot (RETRY_SNAPSHOT_UNAVAILABLE otherwise). Returns SECRET_REQUIRED if the snapshot declares secretEnv, which this delivery round cannot re-resolve.",
+    "Start a new workspace-run task using an earlier task's saved config snapshot. Returns a new runId with parentRunId; jobId equals the new runId. Missing snapshots return RETRY_SNAPSHOT_UNAVAILABLE; snapshots with secretEnv return SECRET_REQUIRED.",
     {
-      runId: z.string().min(1).describe("runId of the run to retry (returned by an earlier workspace-run or run-retry call)."),
-      connectionName: z.string().optional().describe("Target server name from list-servers (the server the original run was launched on). Required when multiple servers are enabled; optional when only one server is enabled."),
-      push: z.boolean().optional().describe("Defaults to the snapshot's own default: true for a profile-backed run that declared push.paths, but FALSE for a run launched inline without pushPaths (an inline run never pushed in the first place, so its retry does not either). Pass true to force a re-push -- only meaningful if the snapshot actually has push sources, otherwise it returns INVALID_CONFIGURATION -- or false to reuse whatever code is already on remoteRoot."),
-      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
+      runId: z.string().min(1).describe("Original workspace-run/run-retry runId."),
+      connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
+      push: z.boolean().optional().describe("Defaults to saved defaultPush, otherwise true. Inline without pushPaths saves false. True requires saved push sources; false reuses current remote code."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
     },
     async ({ runId, connectionName, push, reuseConnection }) => {
       try {
@@ -31,7 +31,7 @@ export function registerRunRetryTool(server: McpServer): void {
           jobId: result.runId,
           state: result.status.state,
           message: `Retried run '${runId}' as new run '${result.runId}' on server '${result.server}'.`,
-          next: `Poll run-status { runId: "${result.runId}" } or run-logs { runId: "${result.runId}" } for progress; run-cancel { runId: "${result.runId}" } to stop it.`,
+          next: `Poll run-status { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } or run-logs { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } for progress; run-cancel { "runId": ${JSON.stringify(result.runId)}, "connectionName": ${JSON.stringify(result.server)} } to stop it.`,
           details: { runId: result.runId, parentRunId: runId, server: result.server, phases: result.phases, status: result.status, collect: result.collect },
         });
       } catch (error) {

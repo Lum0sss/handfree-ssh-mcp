@@ -8,13 +8,13 @@ export function registerRunListTool(server: McpServer): void {
 
   server.tool(
     "run-list",
-    `List workspace-run runs on a server, newest first, by reading ~/.handfree-runs/ over SFTP (no local cache). Bounded to ${MAX_RUN_LIST_LIMIT} entries max per call regardless of the requested limit. A run whose state directory is corrupt or mid-write is silently omitted from the list (query it directly with run-status for the detailed error).`,
+    "List workspace-run tasks on the selected server, newest first. Reads remote state; corrupt or incomplete entries are omitted (query run-status for their errors). Default limit 50, maximum 200.",
     {
-      connectionName: z.string().optional().describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
-      profile: z.string().optional().describe("Only return runs launched under this runProfiles.<name>. Runs launched inline (no profile -- remoteRoot + venv/executable passed straight to workspace-run) are all recorded under the literal label \"(ad-hoc)\", so pass that to list them."),
-      state: z.enum(["running", "completed", "failed", "cancelled", "recovering", "orphaned"]).optional().describe("Only return runs in this state."),
-      limit: z.number().int().positive().max(MAX_RUN_LIST_LIMIT).optional().describe(`Default ${DEFAULT_RUN_LIST_LIMIT}, max ${MAX_RUN_LIST_LIMIT}.`),
-      reuseConnection: z.boolean().optional().describe("Whether to reuse the cached SSH connection for this server. Default true. Set false after a timeout or suspected stale/bad cached connection to force a fresh one for this call."),
+      connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
+      profile: z.string().optional().describe("Filter by saved profile name, or (ad-hoc) for inline tasks."),
+      state: z.enum(["running", "completed", "failed", "cancelled", "recovering", "orphaned"]).optional().describe("Filter by task state."),
+      limit: z.number().int().positive().max(MAX_RUN_LIST_LIMIT).optional().describe("Default 50, maximum 200."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
     },
     async ({ connectionName, profile, state, limit, reuseConnection }) => {
       try {

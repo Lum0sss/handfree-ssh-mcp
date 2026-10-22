@@ -101,6 +101,8 @@ export function validateTransferCombination(input: TransferCombinationInput): Tr
 // ---------------------------------------------------------------------------
 
 export const MAX_BATCH_UPLOAD_SIZE = 1000;
+/** Upper bound of `fileConcurrency` (files in flight in one multi-file call). */
+export const MAX_FILE_CONCURRENCY = 64;
 
 export const onErrorModeSchema = z.enum(["abort", "continue"]);
 export type OnErrorMode = z.infer<typeof onErrorModeSchema>;
@@ -200,6 +202,6 @@ export const batchUploadParamsSchema = z.object({
   localPath: z.union([z.string(), z.array(z.string()).min(1).max(MAX_BATCH_UPLOAD_SIZE)]),
   remotePath: z.string(),
   onError: onErrorModeSchema.optional().default("abort"),
-  fileConcurrency: z.number().int().positive().max(32).optional(),
+  fileConcurrency: z.number().int().positive().max(MAX_FILE_CONCURRENCY).optional(),
   archive: z.boolean().optional(),
 });

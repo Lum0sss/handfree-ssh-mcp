@@ -13,19 +13,19 @@ export function registerDownloadTool(server: McpServer): void {
 
   server.tool(
     "download",
-    "Download a file from the remote server to the MCP host over SFTP. Use this when you need to inspect or save a remote file locally. By default any absolute remote path is allowed; if the server configures allowedRemoteDirectories, the source must live inside one of those entries — call show-whitelist to check.",
+    "Download one remote file to the MCP host over SFTP. Use transfer with recursive=true for directories. Path policy is available through show-whitelist.",
     {
-      remotePath: z.string().describe("Path to the file on the remote server. Must be an absolute POSIX path (e.g. /var/log/app.log); restricted to allowedRemoteDirectories only if the server configures that list."),
-      localPath: z.string().describe("Destination path on the MCP host. Must be inside the MCP working directory or one of the server's allowedLocalDirectories."),
-      connectionName: z.string().optional().describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
-      reuseConnection: z.boolean().optional().describe("Default true. Reuse the cached SSH connection for SFTP. Set false after a timeout or suspected stale cached SSH connection to force a fresh TCP/SSH connection for this transfer; the fresh connection closes afterwards."),
+      remotePath: z.string().describe("Absolute remote POSIX file path, subject to SFTP path policy."),
+      localPath: z.string().describe("Local destination within the MCP working directory/allowedLocalDirectories unless path policy is disabled."),
+      connectionName: z.string().optional().describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
+      reuseConnection: z.boolean().optional().describe("Default true. Set false to use a fresh SSH connection after a suspected stale connection."),
       timeout: z.number().positive().optional().describe("Timeout in ms for SSH setup and SFTP channel opening. Transfer stream duration itself is not forcibly interrupted by this option."),
-      vvv: z.boolean().optional().describe("Default false. Append bounded SSH/SFTP debug output. For fresh ssh2 handshake logs, also set reuseConnection=false."),
-      fast: z.boolean().optional().describe("Default true. Use ssh2 fastGet for a single-file download, which performs parallel SFTP reads for better throughput. Set false for the buffered compatibility path."),
-      sftpConcurrency: z.number().int().positive().optional().describe("Only used when fast=true. Number of concurrent SFTP chunks for ssh2 fastGet; omitted uses ssh2's default."),
-      chunkSize: z.number().int().positive().optional().describe("Only used when fast=true. Bytes per SFTP request. Omitted uses the mode's default."),
+      vvv: z.boolean().optional().describe("Default false. Include bounded SSH debug output; fresh handshake logs also require reuseConnection=false."),
+      fast: z.boolean().optional().describe("Default true: parallel SFTP chunks via fastGet. False uses buffered download."),
+      sftpConcurrency: z.number().int().positive().optional().describe("Concurrent SFTP chunks when fast=true; default ssh2 setting."),
+      chunkSize: z.number().int().positive().optional().describe("Bytes per SFTP chunk when fast=true; default mode setting."),
       connections: z.number().int().positive().optional().describe(
-        "Default 1 (today's single-connection behavior, unchanged). A value above 1 pulls the file over that many independent SSH/TCP connections, each fetching its own non-overlapping byte range; maximum 8. Each connection is a separate TCP+SSH handshake, not an extra channel on one connection, and all N handshakes happen concurrently -- so the relevant remote limit is sshd's MaxStartups (concurrent unauthenticated connections; OpenSSH's default 10:30:100 starts dropping at 10), not MaxSessions. Measured on a 50ms/1Gbps link against 17.5 MiB/s for one connection: 2 -> 28.5, 4 -> 45.7, 8 -> 53.9 MiB/s, i.e. diminishing returns past 4. Gains depend on your link's RTT and bandwidth; none on a fast LAN. Ignores fast/sftpConcurrency/chunkSize when above 1; reuseConnection=false bypasses the pool (fresh connections, closed afterwards). The connections are pooled per server (at most 8 per server; a transfer needing more waits; idle ones close after 60 s), so a repeated transfer reuses them and skips the handshakes.",
+        "Independent SSH/TCP connections for one file: default 1, maximum 8. Above 1 splits byte ranges and ignores fast/sftpConcurrency/chunkSize. Helps high-latency links; see help for limits.",
       ),
     },
     async ({ remotePath, localPath, connectionName, reuseConnection, timeout, vvv, fast, sftpConcurrency, chunkSize, connections }) => {

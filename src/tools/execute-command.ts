@@ -16,37 +16,37 @@ export function registerExecuteCommandTool(server: McpServer): void {
 
   server.tool(
     "execute-command",
-    "Execute a shell command on a remote server over SSH. By default stream=true starts the command in the background and returns immediately with runId/logPath; use command-status to poll status and incremental live output. Set stream=false for short commands where you want to wait for the final output in the same tool call. SSH connections are reused by default for speed; if an execute-command call times out or you suspect a stale cached SSH connection, retry with reuseConnection=false to force a fresh TCP/SSH connection for that command. Set vvv=true only when debugging SSH/channel issues; with reuseConnection=false it includes ssh2 handshake/debug lines in the result or error. For stream=false, returned text is tail-only-capped at maxOutputBytes per stream and full stdout/stderr is persisted under <cwd>/.handfree-output/<server>/<user>/.",
+    "Execute cmdString unchanged in the remote default shell. stream=false waits for output; stream=true (default) returns runId/logPath immediately for polling with command-status. Each call has separate shell state. Background status is lost on MCP restart; use workspace-run for durable tasks. Full output is saved locally; returned output is capped.",
     {
-      cmdString: z.string().describe("Exact remote shell command to run. Prefer a single command per call, for example 'pwd', 'ls -la', 'cat /etc/hostname', or 'git status'. Compound commands may be blocked by command policy even if each subcommand is safe."),
+      cmdString: z.string().describe("Exact command for the remote default shell, e.g. pwd or ls -la. No interpreter prefix is required. Compound commands remain subject to command policy."),
       connectionName: z
         .string()
         .optional()
-        .describe("Target server name from list-servers. Required when multiple servers are enabled; optional when only one server is enabled."),
+        .describe("Server name from list-servers. Required with multiple enabled servers; optional with one."),
       timeout: z
         .number()
         .positive()
         .optional()
         .describe(
-          "Timeout in milliseconds applied separately to SSH connection setup, exec-channel opening, and remote command execution for each attempt. Defaults to 300000 when stream=true and 30000 when stream=false. Increase this for long-running commands; reduce it for fast probes."
+          "Milliseconds per attempt: SSH setup and command execution use this cap; channel opening also respects channelOpenTimeout. Default 300000 for stream=true, 30000 otherwise."
         ),
       stream: z
         .boolean()
         .optional()
         .describe(
-          "Default true. When true, start the command in the background and return runId/logPath immediately; poll with command-status. Use false for short commands like pwd, ls, cat, head, tail, or git status when you need the final result now."
+          "Default true: return immediately and poll command-status. False: wait for final output in this call."
         ),
       reuseConnection: z
         .boolean()
         .optional()
         .describe(
-          "Whether to reuse the cached SSH connection for this server. Default is true for speed. Set false after a timeout or suspected stale/bad cached connection; false opens a fresh SSH connection for this command and closes it afterwards."
+          "Default true. Set false to use a fresh SSH connection after a suspected stale connection."
         ),
       vvv: z
         .boolean()
         .optional()
         .describe(
-          "Default false. When true, append bounded SSH/channel debug output to the result or error. For full ssh2 handshake debug, also set reuseConnection=false; already-reused cached clients cannot retroactively emit handshake logs."
+          "Default false. Include bounded SSH debug output; fresh handshake logs also require reuseConnection=false."
         ),
       maxOutputBytes: z
         .number()
@@ -54,7 +54,7 @@ export function registerExecuteCommandTool(server: McpServer): void {
         .nonnegative()
         .optional()
         .describe(
-          "Per-stream cap on bytes returned to the caller (tail-only). Applied independently to stdout and stderr, so the combined response can be up to ~2x this value. Defaults to 65536 (64 KiB). The full output is always saved to disk regardless; only the returned text is trimmed. Set higher when you need more context, lower to save tokens."
+          "Returned tail limit per stdout/stderr stream, default 65536 bytes. Full output is saved to disk; 0 returns no captured output."
         ),
     },
     async ({ cmdString, connectionName, timeout, stream, reuseConnection, vvv, maxOutputBytes }, extra) => {
