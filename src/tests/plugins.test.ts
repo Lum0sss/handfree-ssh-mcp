@@ -457,7 +457,7 @@ test('REXP discovery finds an isolated runtime without PATH activation, PyYAML, 
     const localAppData=path.join(home,'AppData','Local');
     const entry=windows?path.join(localAppData,'rexprun','bin','rexp.cmd'):path.join(home,'.local','bin','rexp');
     fs.mkdirSync(path.dirname(entry),{recursive:true});fs.writeFileSync(entry,windows?`@echo off\n"${python}" -m rexp %*\n`:`#!${python}\n`);
-    const env={...process.env,HOME:home,USERPROFILE:home,LOCALAPPDATA:localAppData,REXP_HOME:path.join(home,'.rexp'),PYTHONDONTWRITEBYTECODE:'1'};
+    const env={...process.env,HOME:home,USERPROFILE:home,LOCALAPPDATA:localAppData,REXP_HOME:path.join(home,'.rexp'),PYTHONDONTWRITEBYTECODE:'1',PYTHONIOENCODING:'ascii'};
     const result=JSON.parse(execFileSync(python,['-c',script,'{}'],{env:{...env,PLATFORM_ROOT:path.join(dir,'someone-else-platform')},encoding:'utf8'}));
     assert.equal(result.state,'ready',result.message);assert.equal(result.settings.platformRoot,root);assert.equal(result.settings.rexpPath,entry);
     assert.equal(fs.realpathSync(path.dirname(result.settings.platformPython)),fs.realpathSync(path.dirname(python)));assert.ok(!fs.existsSync(path.join(purelib,'rexp','__pycache__')));
